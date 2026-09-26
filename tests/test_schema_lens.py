@@ -1,12 +1,21 @@
 import io
 import json
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 
 from schema_lens import Lens, SchemaConflict
-from schema_lens.__main__ import main as cli_main
+from schema_lens.__main__ import _read_records, main as cli_main
+from schema_lens.core import LOCK_FILENAME, SCHEMA_FILENAME, SCHEMA_VERSION
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 
 
 class InferTests(unittest.TestCase):
@@ -176,6 +185,400 @@ class PersistenceTests(unittest.TestCase):
     def test_save_without_schema_raises(self):
         with self.assertRaises(SchemaConflict):
             Lens(self.dir.name).save()
+
+
+_WORKER = """
+import json
+import sys
+
+from schema_lens import Lens, SchemaConflict
+
+lens_dir, records_path = sys.argv[1], sys.argv[2]
+records = []
+with open(records_path, encoding="utf-8") as handle:
+    for line in handle:
+        line = line.strip()
+        if line:
+            records.append(json.loads(line))
+lens = Lens(lens_dir)
+try:
+    lens.load()
+except SchemaConflict:
+    pass
+lens.infer(records)
+lens.save()
+print(json.dumps(lens.stats(), sort_keys=True))
+"""
+
+_LOCK_HOLDER = """
+import os
+import sys
+import time
+
+import fcntl
+
+fd = os.open(os.path.join(sys.argv[1], "schema.lock"),
+             os.O_RDWR | os.O_CREAT, 0o644)
+fcntl.flock(fd, fcntl.LOCK_EX)
+sys.stdout.write("locked\\n")
+sys.stdout.flush()
+time.sleep(float(sys.argv[2]))
+"""
+
+
+def _fold_all(records):
+    lens = Lens(tempfile.mkdtemp())
+    lens.infer(records)
+    return lens.schema()
+
+
+class IncrementalPersistenceTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+
+    def test_repeated_appends_equal_one_shot_fold(self):
+        batches = [
+            [{"a": 1, "b": "x"}, {"a": 2}],
+            [{"a": 3, "b": "y"}, {"b": "z", "c": True}],
+            [{"a": None}, {"c": False}, {"a": 4, "b": "w"}],
+        ]
+        lens = Lens(self.dir.name)
+        for batch in batches:
+            lens.infer(batch)
+            lens.save()
+        reloaded = Lens(self.dir.name)
+        reloaded.load()
+        all_records = [record for batch in batches for record in batch]
+        self.assertEqual(reloaded.schema(), _fold_all(all_records))
+        stats = reloaded.stats()
+        self.assertEqual(stats["records"], 7)
+        self.assertTrue(reloaded.schema()["fields"]["a"]["optional"])
+        self.assertEqual(
+            sorted(reloaded.schema()["fields"]["a"]["types"]),
+            ["null", "number"],
+        )
+
+    def test_earlier_folded_records_survive_later_appends(self):
+        lens = Lens(self.dir.name)
+        lens.infer([{"a": 1}, {"a": 2, "b": "x"}])
+        lens.save()
+        lens.infer([{"c": [1, 2]}, {"c": [None]}])
+        lens.save()
+        reloaded = Lens(self.dir.name)
+        reloaded.load()
+        fields = reloaded.schema()["fields"]
+        self.assertEqual(set(fields), {"a", "b", "c"})
+        self.assertEqual(fields["a"]["observed"], 2)
+        self.assertEqual(fields["a"]["total"], 4)
+        elements = fields["c"]["types"]["array"]["elements"]
+        self.assertEqual(set(elements), {"null", "number"})
+        # A record without the sparsely observed fields still matches, but a
+        # wrong value for the always-present field a is still reported.
+        self.assertEqual(reloaded.check({}), [])
+        self.assertEqual(
+            reloaded.check({"a": "s", "b": "x", "c": []}),
+            ["$.a: type string not in field types [number]"],
+        )
+
+    def test_separate_lens_instances_build_on_each_others_commits(self):
+        first = Lens(self.dir.name)
+        first.infer([{"a": 1}, {"a": 2}])
+        first.save()
+        second = Lens(self.dir.name)
+        second.load()
+        second.infer([{"a": 3, "b": "x"}])
+        second.save()
+        first.infer([{"b": "y"}])
+        first.save()
+        reloaded = Lens(self.dir.name)
+        reloaded.load()
+        self.assertEqual(reloaded.stats()["records"], 4)
+        expected = _fold_all(
+            [{"a": 1}, {"a": 2}, {"a": 3, "b": "x"}, {"b": "y"}]
+        )
+        self.assertEqual(reloaded.schema(), expected)
+
+    def test_uncommitted_memory_is_not_published(self):
+        first = Lens(self.dir.name)
+        first.infer([{"a": 1}])
+        first.save()
+        second = Lens(self.dir.name)
+        second.load()
+        second.infer([{"secret": 1}])  # no save
+        reloaded = Lens(self.dir.name)
+        reloaded.load()
+        self.assertNotIn("secret", reloaded.schema()["fields"])
+
+    def test_separate_processes_appending_lose_no_batches(self):
+        lens_dir = self.dir.name
+        batch_files = []
+        batches = [
+            [{"a": 1, "b": "x"}, {"a": 2}],
+            [{"a": 3}, {"b": "y", "c": True}],
+            [{"a": None}, {"a": 4, "c": False}],
+        ]
+        for index, batch in enumerate(batches):
+            path = Path(self.dir.name, f"batch-{index}.jsonl")
+            path.write_text(
+                "".join(json.dumps(record) + "\n" for record in batch),
+                encoding="utf-8",
+            )
+            batch_files.append(str(path))
+        worker = Path(self.dir.name, "worker.py")
+        worker.write_text(_WORKER, encoding="utf-8")
+        env = dict(os.environ)
+        repo_root = str(Path(__file__).resolve().parents[1])
+        env["PYTHONPATH"] = repo_root + os.pathsep + env.get("PYTHONPATH", "")
+        for path in batch_files:
+            proc = subprocess.run(
+                [sys.executable, str(worker), lens_dir, path],
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+        reloaded = Lens(lens_dir)
+        reloaded.load()
+        all_records = [record for batch in batches for record in batch]
+        self.assertEqual(reloaded.schema(), _fold_all(all_records))
+        self.assertEqual(reloaded.stats()["records"], 6)
+
+
+class ChecksummedFileTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.lens = Lens(self.dir.name)
+        self.lens.infer([{"a": 1, "b": "x"}, {"a": "s"}])
+        self.lens.save()
+
+    def test_file_carries_version_and_checksum_of_schema(self):
+        payload = json.loads(Path(self.dir.name, SCHEMA_FILENAME).read_text())
+        self.assertEqual(payload["version"], SCHEMA_VERSION)
+        self.assertEqual(len(payload["checksum"]), 64)
+        self.assertTrue(all(c in "0123456789abcdef" for c in payload["checksum"]))
+
+    def test_checksum_mismatch_raises_and_preserves_memory(self):
+        path = Path(self.dir.name, SCHEMA_FILENAME)
+        payload = json.loads(path.read_text())
+        payload["root"]["count"] += 100
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        before = self.lens.schema()
+        with self.assertRaises(SchemaConflict):
+            self.lens.load()
+        self.assertEqual(self.lens.schema(), before)
+
+    def test_rewritten_checksum_raises_and_preserves_memory(self):
+        path = Path(self.dir.name, SCHEMA_FILENAME)
+        payload = json.loads(path.read_text())
+        payload["checksum"] = "0" * 64
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        before = self.lens.schema()
+        with self.assertRaises(SchemaConflict):
+            self.lens.load()
+        self.assertEqual(self.lens.schema(), before)
+
+    def test_unknown_version_raises_and_preserves_memory(self):
+        path = Path(self.dir.name, SCHEMA_FILENAME)
+        payload = json.loads(path.read_text())
+        payload["version"] = 999
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        before = self.lens.schema()
+        with self.assertRaises(SchemaConflict):
+            self.lens.load()
+        self.assertEqual(self.lens.schema(), before)
+
+    def test_truncated_half_file_raises_and_preserves_memory(self):
+        path = Path(self.dir.name, SCHEMA_FILENAME)
+        raw = path.read_text(encoding="utf-8")
+        path.write_text(raw[: len(raw) // 2], encoding="utf-8")
+        before = self.lens.schema()
+        with self.assertRaises(SchemaConflict):
+            self.lens.load()
+        self.assertEqual(self.lens.schema(), before)
+
+    def test_successful_commit_leaves_no_half_file(self):
+        names = set(os.listdir(self.dir.name))
+        self.assertIn(SCHEMA_FILENAME, names)
+        self.assertNotIn(SCHEMA_FILENAME + ".tmp", names)
+        # A stale temp file from a crashed writer never masks the full schema.
+        Path(self.dir.name, SCHEMA_FILENAME + ".tmp").write_text("{half", encoding="utf-8")
+        reloaded = Lens(self.dir.name)
+        reloaded.load()
+        self.assertEqual(reloaded.schema(), self.lens.schema())
+
+    def test_save_against_corrupt_disk_raises_and_preserves_memory(self):
+        from schema_lens.core import SCHEMA_VERSION, _checksum
+
+        with tempfile.TemporaryDirectory() as clean:
+            lens = Lens(clean)
+            lens.infer([{"a": 1}])
+            lens.save()
+            first_batch = lens.schema()
+            lens.infer([{"b": 2}])
+            memory = lens.schema()
+            Path(clean, SCHEMA_FILENAME).write_text("{broken", encoding="utf-8")
+            with self.assertRaises(SchemaConflict):
+                lens.save()
+            self.assertEqual(lens.schema(), memory)
+            # Once disk is healthy again, retrying commits the held delta.
+            Path(clean, SCHEMA_FILENAME).write_text(
+                json.dumps(
+                    {
+                        "version": SCHEMA_VERSION,
+                        "checksum": _checksum(first_batch),
+                        "root": first_batch,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            lens.save()
+            reloaded = Lens(clean)
+            reloaded.load()
+            self.assertEqual(reloaded.stats()["records"], 2)
+            self.assertEqual(set(reloaded.schema()["fields"]), {"a", "b"})
+
+
+@unittest.skipIf(fcntl is None, "flock is only available on POSIX")
+class LockTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.holder = Path(self.dir.name, "hold_lock.py")
+        self.holder.write_text(_LOCK_HOLDER, encoding="utf-8")
+
+    def test_contended_lock_raises_conflict_without_touching_commit(self):
+        lens_dir = self.dir.name
+        lens = Lens(lens_dir)
+        lens.infer([{"a": 1}])
+        lens.save()
+        before = Path(lens_dir, SCHEMA_FILENAME).read_bytes()
+        proc = subprocess.Popen(
+            [sys.executable, str(self.holder), lens_dir, "3"],
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        self.assertEqual(proc.stdout.readline().strip(), "locked")
+        try:
+            lens.infer([{"b": 2}])
+            memory_at_commit = lens.schema()
+            with self.assertRaises(SchemaConflict):
+                lens.save()
+            # The failed commit neither touched the stored file nor rolled
+            # back (nor published) the in-memory schema.
+            self.assertEqual(
+                Path(lens_dir, SCHEMA_FILENAME).read_bytes(), before
+            )
+            self.assertEqual(lens.schema(), memory_at_commit)
+        finally:
+            proc.wait()
+            proc.stdout.close()
+        lens.save()
+        reloaded = Lens(lens_dir)
+        reloaded.load()
+        self.assertEqual(reloaded.stats()["records"], 2)
+        self.assertEqual(set(reloaded.schema()["fields"]), {"a", "b"})
+
+    def test_two_threads_in_one_process_are_serialized(self):
+        lens = Lens(self.dir.name)
+        lens.infer([{"a": 1}])
+        lens.save()
+
+        import threading
+
+        held = threading.Event()
+        release = threading.Event()
+
+        def hold():
+            lens2 = Lens(self.dir.name)
+            lens2.infer([{"held": 1}])
+            lens2._lock.acquire()
+            held.set()
+            release.wait(timeout=5)
+            lens2._lock.release()
+
+        thread = threading.Thread(target=hold)
+        thread.start()
+        self.addCleanup(thread.join)
+        held.wait(timeout=5)
+        other = Lens(self.dir.name)
+        other.infer([{"b": 2}])
+        with self.assertRaises(SchemaConflict):
+            other.save()
+        release.set()
+        thread.join()
+
+    def test_lock_file_lives_inside_lens_directory(self):
+        lens = Lens(self.dir.name)
+        lens.infer([{"a": 1}])
+        lens.save()
+        self.assertTrue((Path(self.dir.name) / LOCK_FILENAME).exists())
+
+
+class DottedKeyPathTests(unittest.TestCase):
+    def test_dotted_key_path_is_distinguishable_from_nested_path(self):
+        lens = Lens(tempfile.mkdtemp())
+        lens.infer([{"a.b": 1, "a": {"b": 2}}])
+        reports = lens.check({"a.b": "x", "a": {"b": "x"}})
+        self.assertIn('$["a.b"]: type string not in field types [number]', reports)
+        self.assertIn("$.a.b: type string not in field types [number]", reports)
+        self.assertEqual(len(reports), 2)
+
+    def test_backslash_key_path_is_quoted(self):
+        lens = Lens(tempfile.mkdtemp())
+        lens.infer([{"a\\b": 1}])
+        reports = lens.check({"a\\b": "x"})
+        self.assertEqual(
+            reports, ['$["a\\\\b"]: type string not in field types [number]']
+        )
+
+    def test_missing_dotted_key_uses_quoted_path(self):
+        lens = Lens(tempfile.mkdtemp())
+        lens.infer([{"a.b": 1}, {"a.b": 2}])
+        reports = lens.check({})
+        self.assertEqual(reports, ['$["a.b"]: missing required field'])
+
+    def test_unexpected_dotted_key_uses_quoted_path(self):
+        lens = Lens(tempfile.mkdtemp())
+        lens.infer([{"a": 1}])
+        reports = lens.check({"a": 1, "x.y": 2})
+        self.assertEqual(reports, ['$["x.y"]: unexpected field'])
+
+
+class ReadRecordsTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+
+    def test_non_object_line_raises_value_error_with_line_number(self):
+        path = Path(self.dir.name, "records.jsonl")
+        path.write_text('{"a": 1}\n[1, 2]\n', encoding="utf-8")
+        with self.assertRaises(ValueError) as ctx:
+            _read_records(str(path))
+        message = str(ctx.exception)
+        self.assertIn(str(path), message)
+        self.assertIn("2", message)
+
+    def test_invalid_json_line_raises_value_error_with_line_number(self):
+        path = Path(self.dir.name, "records.jsonl")
+        path.write_text('{"a": 1}\n{broken\n', encoding="utf-8")
+        with self.assertRaises(ValueError) as ctx:
+            _read_records(str(path))
+        self.assertIn("2", str(ctx.exception))
+
+    def test_missing_records_file_raises_value_error(self):
+        path = Path(self.dir.name, "missing.jsonl")
+        with self.assertRaises(ValueError):
+            _read_records(str(path))
+
+    def test_cli_non_object_line_exits_nonzero_with_line_number(self):
+        records = Path(self.dir.name, "records.jsonl")
+        records.write_text("[1, 2]\n", encoding="utf-8")
+        out = io.StringIO()
+        with redirect_stdout(io.StringIO()):
+            code = cli_main(["--path", self.dir.name, "infer", str(records)])
+        self.assertEqual(code, 2)
 
 
 class StatsTests(unittest.TestCase):

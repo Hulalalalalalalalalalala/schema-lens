@@ -11,15 +11,22 @@ from .core import Lens, SchemaConflict
 
 def _read_records(path: str) -> list:
     records = []
-    with open(path, "r", encoding="utf-8") as handle:
+    try:
+        handle = open(path, "r", encoding="utf-8")
+    except OSError as exc:
+        raise ValueError(f"{path}: cannot read records file: {exc}") from exc
+    with handle:
         for lineno, line in enumerate(handle, 1):
             line = line.strip()
             if not line:
                 continue
             try:
-                records.append(json.loads(line))
+                record = json.loads(line)
             except json.JSONDecodeError as exc:
                 raise ValueError(f"{path}:{lineno}: invalid JSON: {exc}") from exc
+            if not isinstance(record, dict):
+                raise ValueError(f"{path}:{lineno}: record is not a JSON object")
+            records.append(record)
     return records
 
 

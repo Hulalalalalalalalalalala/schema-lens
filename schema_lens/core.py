@@ -4,17 +4,39 @@ A schema is a tree of nodes. Object nodes carry a mapping of field name to
 field entry; each field entry records the set of observed types, how many
 records carried the field, how many records were seen at that level, and
 whether the field is optional. Array nodes merge their element types.
+
+Persistence is incremental and crash safe. ``Lens.save`` serializes commits
+through a lock file inside the lens directory, folds the records folded
+since the last load or save into whatever schema is already stored, and
+writes the result as one atomic file replacement carrying a version and a
+checksum of the whole schema. ``Lens.load`` validates version, structure and
+checksum completely before replacing memory, so a crashed or interrupted
+write can only ever leave the previous complete schema or the next complete
+one, and concurrent committers never lose each other's batches.
 """
 
 from __future__ import annotations
 
+import contextlib
 import copy
+import hashlib
 import json
 import os
+import threading
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None  # type: ignore[assignment]
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - POSIX
+    msvcrt = None  # type: ignore[assignment]
 
 SCHEMA_FILENAME = "schema.json"
+LOCK_FILENAME = "schema.lock"
 SCHEMA_VERSION = 1
 
 _KINDS = ("null", "boolean", "number", "string", "array", "object")
@@ -91,7 +113,105 @@ def _refresh_node(node: dict) -> None:
             _refresh_node(child)
 
 
+def _merge_node(left: dict, right: dict) -> dict:
+    """Fold two schema nodes over disjoint batches into one new node."""
+    kind = left["kind"]
+    if kind == "object":
+        node = _new_node("object")
+        node["count"] = left["count"] + right["count"]
+        names = list(left["fields"]) + [
+            name for name in right["fields"] if name not in left["fields"]
+        ]
+        for name in names:
+            le = left["fields"].get(name)
+            re = right["fields"].get(name)
+            if le is None:
+                node["fields"][name] = copy.deepcopy(re)
+            elif re is None:
+                node["fields"][name] = copy.deepcopy(le)
+            else:
+                node["fields"][name] = _merge_field(le, re)
+        return node
+    if kind == "array":
+        node = _new_node("array")
+        kinds = list(left["elements"]) + [
+            element_kind
+            for element_kind in right["elements"]
+            if element_kind not in left["elements"]
+        ]
+        for element_kind in kinds:
+            lc = left["elements"].get(element_kind)
+            rc = right["elements"].get(element_kind)
+            if lc is None:
+                node["elements"][element_kind] = copy.deepcopy(rc)
+            elif rc is None:
+                node["elements"][element_kind] = copy.deepcopy(lc)
+            else:
+                node["elements"][element_kind] = _merge_node(lc, rc)
+        return node
+    return _new_node(kind)
+
+
+def _merge_field(left: dict, right: dict) -> dict:
+    """Fold two field entries over disjoint batches into one new entry."""
+    entry = _new_field()
+    entry["observed"] = left["observed"] + right["observed"]
+    kinds = list(left["types"]) + [
+        kind for kind in right["types"] if kind not in left["types"]
+    ]
+    for kind in kinds:
+        lc = left["types"].get(kind)
+        rc = right["types"].get(kind)
+        if lc is None:
+            entry["types"][kind] = copy.deepcopy(rc)
+        elif rc is None:
+            entry["types"][kind] = copy.deepcopy(lc)
+        else:
+            entry["types"][kind] = _merge_node(lc, rc)
+    return entry
+
+
+def _subtract_node(mem: dict, base: dict) -> dict:
+    """Return the part of ``mem`` folded after ``base`` was taken."""
+    kind = mem["kind"]
+    if kind == "object":
+        node = _new_node("object")
+        node["count"] = mem["count"] - base["count"]
+        for name, entry in mem["fields"].items():
+            base_entry = base["fields"].get(name)
+            if base_entry is None:
+                node["fields"][name] = copy.deepcopy(entry)
+            else:
+                node["fields"][name] = _subtract_field(entry, base_entry)
+        return node
+    if kind == "array":
+        node = _new_node("array")
+        for element_kind, child in mem["elements"].items():
+            base_child = base["elements"].get(element_kind)
+            if base_child is None:
+                node["elements"][element_kind] = copy.deepcopy(child)
+            else:
+                node["elements"][element_kind] = _subtract_node(child, base_child)
+        return node
+    return _new_node(kind)
+
+
+def _subtract_field(mem: dict, base: dict) -> dict:
+    entry = _new_field()
+    entry["observed"] = mem["observed"] - base["observed"]
+    for kind, child in mem["types"].items():
+        base_child = base["types"].get(kind)
+        if base_child is None:
+            entry["types"][kind] = copy.deepcopy(child)
+        else:
+            entry["types"][kind] = _subtract_node(child, base_child)
+    return entry
+
+
 def _join(path: str, name: str) -> str:
+    # An identifier is joined with a dot; every other key is quoted in
+    # brackets so a name containing a dot or a backslash can never be read
+    # as a path separator: $["a.b"] is distinct from $.a.b.
     if name.isidentifier():
         return f"{path}.{name}"
     return f"{path}[{json.dumps(name)}]"
@@ -131,7 +251,7 @@ def _validate_node(node: Any) -> None:
     if kind == "object":
         fields = node.get("fields")
         count = node.get("count")
-        if not isinstance(fields, dict) or not isinstance(count, int):
+        if isinstance(count, bool) or not isinstance(fields, dict) or not isinstance(count, int):
             raise SchemaConflict("corrupt schema file: malformed object node")
         for entry in fields.values():
             _validate_field(entry)
@@ -152,7 +272,9 @@ def _validate_field(entry: Any) -> None:
     optional = entry.get("optional")
     if (
         not isinstance(types, dict)
+        or isinstance(observed, bool)
         or not isinstance(observed, int)
+        or isinstance(total, bool)
         or not isinstance(total, int)
         or not isinstance(optional, bool)
     ):
@@ -161,14 +283,127 @@ def _validate_field(entry: Any) -> None:
         _validate_node(child)
 
 
+def _checksum(root: dict) -> str:
+    """Checksum of the whole schema in its canonical JSON encoding."""
+    canonical = json.dumps(root, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def _validate_payload(payload: Any) -> dict:
-    if not isinstance(payload, dict) or "root" not in payload:
+    if not isinstance(payload, dict):
+        raise SchemaConflict("corrupt schema file: not a JSON object")
+    version = payload.get("version")
+    if version != SCHEMA_VERSION:
+        raise SchemaConflict(f"unsupported schema version: {version!r}")
+    checksum = payload.get("checksum")
+    if not isinstance(checksum, str):
+        raise SchemaConflict("corrupt schema file: missing checksum")
+    if "root" not in payload:
         raise SchemaConflict("corrupt schema file: missing root")
     root = payload["root"]
     _validate_node(root)
     if not isinstance(root, dict) or root.get("kind") != "object":
         raise SchemaConflict("corrupt schema file: root must be an object")
+    if _checksum(root) != checksum:
+        raise SchemaConflict("corrupt schema file: checksum mismatch")
     return root
+
+
+def _fsync_dir(directory: Path) -> None:
+    try:
+        fd = os.open(directory, os.O_RDONLY)
+    except OSError:  # pragma: no cover - platform dependent
+        return
+    try:
+        os.fsync(fd)
+    except OSError:  # pragma: no cover - platform dependent
+        pass
+    finally:
+        os.close(fd)
+
+
+def _write_payload(file_path: Path, root: dict) -> None:
+    """Write the payload atomically: a crash leaves only the old or new file."""
+    payload = {"version": SCHEMA_VERSION, "checksum": _checksum(root), "root": root}
+    text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    tmp = file_path.with_name(file_path.name + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, file_path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    _fsync_dir(file_path.parent)
+
+
+class _DirectoryLock:
+    """Non-blocking commit lock shared by threads and processes."""
+
+    def __init__(self, directory: Path) -> None:
+        self._directory = directory
+        self._thread_lock = threading.Lock()
+        self._fd: int | None = None
+
+    def acquire(self) -> None:
+        if not self._thread_lock.acquire(blocking=False):
+            raise SchemaConflict(
+                "cannot commit schema: another thread holds the lens lock"
+            )
+        try:
+            fd = os.open(
+                self._directory / LOCK_FILENAME, os.O_RDWR | os.O_CREAT, 0o644
+            )
+        except BaseException:
+            self._thread_lock.release()
+            raise
+        try:
+            if fcntl is not None:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError as exc:
+                    raise SchemaConflict(
+                        "cannot commit schema: another process holds the lens lock"
+                    ) from exc
+            elif msvcrt is not None:  # pragma: no cover - Windows
+                os.lseek(fd, 0, os.SEEK_SET)
+                try:
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                except OSError as exc:
+                    raise SchemaConflict(
+                        "cannot commit schema: another process holds the lens lock"
+                    ) from exc
+        except BaseException:
+            os.close(fd)
+            self._thread_lock.release()
+            raise
+        self._fd = fd
+
+    def release(self) -> None:
+        fd = self._fd
+        self._fd = None
+        if fd is not None:
+            if fcntl is not None:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            elif msvcrt is not None:  # pragma: no cover - Windows
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            os.close(fd)
+        self._thread_lock.release()
+
+    @contextlib.contextmanager
+    def held(self) -> Iterator[None]:
+        self.acquire()
+        try:
+            yield
+        finally:
+            self.release()
 
 
 class Lens:
@@ -177,6 +412,8 @@ class Lens:
     def __init__(self, path: os.PathLike | str) -> None:
         self.path = Path(path)
         self._schema: dict | None = None
+        self._base: dict | None = None
+        self._lock = _DirectoryLock(self.path)
 
     @property
     def _file(self) -> Path:
@@ -191,6 +428,7 @@ class Lens:
         """Fold a sequence of records into the stored schema."""
         if self._schema is None:
             self._schema = _new_node("object")
+            self._base = _new_node("object")
         for record in records:
             if not isinstance(record, dict):
                 raise ValueError("records must be JSON objects")
@@ -242,25 +480,55 @@ class Lens:
         walk_object(schema)
         return summary
 
-    def save(self) -> None:
-        """Persist the stored schema into the lens directory."""
-        schema = self._require()
-        self.path.mkdir(parents=True, exist_ok=True)
-        payload = {"version": SCHEMA_VERSION, "root": schema}
-        tmp = self.path / (SCHEMA_FILENAME + ".tmp")
-        tmp.write_text(
-            json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-        )
-        os.replace(tmp, self._file)
+    def _read_disk(self) -> dict | None:
+        """Read and fully validate the stored schema.
 
-    def load(self) -> None:
-        """Re-read the stored schema, replacing memory only on success."""
+        Returns ``None`` only when the lens directory holds no schema yet.
+        """
         try:
             raw = self._file.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
         except OSError as exc:
             raise SchemaConflict(f"cannot read schema file {self._file}: {exc}") from exc
         try:
             payload = json.loads(raw)
         except json.JSONDecodeError as exc:
             raise SchemaConflict(f"corrupt schema file {self._file}: {exc}") from exc
-        self._schema = _validate_payload(payload)
+        return _validate_payload(payload)
+
+    def save(self) -> None:
+        """Commit the stored schema into the lens directory.
+
+        The commit is serialized by a non-blocking lock file in the
+        directory; contention raises SchemaConflict. Under the lock the
+        stored schema is re-read and fully validated, the records folded
+        since the last load or save are merged in, and the result is written
+        as one atomic file replacement carrying a version and a checksum.
+        Memory is replaced only after the write lands, so a failed commit
+        leaves the in-memory schema untouched and earlier commits are never
+        overwritten.
+        """
+        self._require()
+        self.path.mkdir(parents=True, exist_ok=True)
+        with self._lock.held():
+            disk = self._read_disk()
+            if disk is None:
+                merged = copy.deepcopy(self._schema)
+            else:
+                delta = _subtract_node(self._schema, self._base)
+                merged = _merge_node(disk, delta)
+            _refresh_node(merged)
+            _write_payload(self._file, merged)
+        self._schema = merged
+        self._base = copy.deepcopy(merged)
+
+    def load(self) -> None:
+        """Re-read the stored schema, replacing memory only on success."""
+        root = self._read_disk()
+        if root is None:
+            raise SchemaConflict(
+                f"cannot read schema file {self._file}: no such file"
+            )
+        self._schema = root
+        self._base = copy.deepcopy(root)
