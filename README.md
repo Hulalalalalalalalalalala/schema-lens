@@ -26,6 +26,44 @@ Python 3.11 or newer. Standard library only.
 - `stats() -> dict` reports fields, optional fields, observed types and observation counts.
 - `SchemaConflict` exported exception.
 
+## Streaming inference under resource limits
+
+`infer` accepts any iterable, including a generator over a record stream,
+and the command line reads records one at a time, so a single inference can
+be fed millions of records in batches. Folded records are never retained:
+once a record is folded, only the per-field and per-node statistics remain,
+and peak memory tracks the statistics limits below rather than the number
+of records seen.
+
+`Lens(path, max_fields=..., max_depth=...)` (and the matching `--max-fields`
+/ `--max-depth` command line options) bound the statistics memory:
+
+- `max_fields` caps how many field entries each object node tracks
+  exactly. Once the cap is reached, further distinct field names fold into
+  a shared overflow entry kept under the node's `"overflow"` key and
+  flagged `"approximate": true`.
+- `max_depth` caps how deep object and array nodes are tracked (the root
+  is depth 0). Deeper subtrees collapse into summary nodes flagged
+  `"approximate": true` that keep only a record count (objects) or element
+  type kinds (arrays).
+
+Both default to `None`, meaning no limit. With no limit in effect no
+approximation is ever triggered and the folded schema is exactly the
+schema produced by folding every record in one pass. When approximation
+does trigger, the difference against the exact result is confined to the
+marked entries; every unmarked field stays exact. An approximated entry's
+type set can only widen and its observation count only grows as more
+records are folded, so it never silently drops a type it once reported.
+
+Approximation is always visible, never silent: the flags appear in the
+`schema()` tree and the `show` output, and `stats()` lists the path of
+every approximated statistic under its `"approximate"` key — collapsed
+subtrees by their own path, overflow entries as `$["*"]` under their
+object node's path. When checking records, a field name that fell into an
+overflow entry is validated against the overflow entry's widened type set
+instead of being reported as unexpected, and collapsed subtrees are not
+descended into.
+
 ## Incremental inference
 
 Inference is an append process: call `infer` with more batches and `save`
@@ -43,7 +81,13 @@ everything committed in the meantime.
 
 The schema is stored as `schema.json`, a single JSON object with a
 `version`, a `checksum` (a SHA-256 of the whole schema in canonical form)
-and the `root` schema. Each commit writes a fresh file and atomically
+and the `root` schema. The current format version is 2; version 1 files
+are still read, and are migrated in place by one atomic replacement the
+first time they are read, so after migration the file's checksum matches
+its content again. A failed migration (say, an unwritable directory)
+leaves the original file byte for byte untouched, leaves the in-memory
+schema exactly as it was, and raises `SchemaConflict`, so the read can
+simply be retried later. Each commit writes a fresh file and atomically
 replaces the old one, so a crash or interrupted write can only leave the
 previous complete schema or the new complete schema — never a readable file
 that fails its checksum. `load` parses and fully validates the version, the

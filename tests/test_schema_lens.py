@@ -641,5 +641,314 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, 2)
 
 
+class ResourceLimitTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+
+    def _exact(self, records):
+        lens = Lens(tempfile.mkdtemp())
+        lens.infer(records)
+        return lens.schema()
+
+    def test_generous_limits_match_unlimited_fold(self):
+        records = [
+            {"a": 1, "b": {"c": [1, "x"], "d": True}},
+            {"a": "s", "b": {"c": [], "e": None}},
+        ]
+        lens = Lens(self.dir.name, max_fields=50, max_depth=50)
+        lens.infer(records)
+        self.assertEqual(lens.schema(), self._exact(records))
+        self.assertEqual(lens.stats()["approximate"], [])
+
+    def test_no_limits_adds_no_marker_keys(self):
+        lens = Lens(self.dir.name)
+        lens.infer([{"a": {"b": [1]}}])
+        self.assertNotIn("overflow", lens.schema())
+        self.assertNotIn("approximate", json.dumps(lens.schema()))
+
+    def test_field_cap_overflow_is_marked_and_widens(self):
+        lens = Lens(self.dir.name, max_fields=1)
+        lens.infer([{"a": 1, "b": 2}, {"a": 3, "b": "x", "c": True}])
+        root = lens.schema()
+        self.assertEqual(list(root["fields"]), ["a"])
+        overflow = root["overflow"]
+        self.assertTrue(overflow["approximate"])
+        # b seen twice, c once; types only widen across batches.
+        self.assertEqual(overflow["observed"], 3)
+        self.assertEqual(sorted(overflow["types"]), ["boolean", "number", "string"])
+        # The exact field is untouched by the approximation.
+        self.assertEqual(root["fields"]["a"]["observed"], 2)
+        self.assertEqual(sorted(root["fields"]["a"]["types"]), ["number"])
+
+    def test_overflow_observations_grow_monotonically_across_batches(self):
+        lens = Lens(self.dir.name, max_fields=1)
+        seen = 0
+        for batch in [[{"a": 1, "x": 1}], [{"a": 2, "y": "s"}, {"a": 3, "z": None}]]:
+            lens.infer(batch)
+            overflow = lens.schema()["overflow"]
+            self.assertGreater(overflow["observed"], seen)
+            seen = overflow["observed"]
+        self.assertEqual(
+            sorted(lens.schema()["overflow"]["types"]), ["null", "number", "string"]
+        )
+
+    def test_overflow_fields_are_not_unexpected_in_check(self):
+        lens = Lens(self.dir.name, max_fields=1)
+        lens.infer([{"a": 1, "b": 2}])
+        self.assertEqual(lens.check({"a": 1, "b": 2, "c": 3}), [])
+        reports = lens.check({"a": 1, "b": "x"})
+        self.assertIn('$.b: type string not in field types [number]', reports)
+
+    def test_depth_cap_collapses_nested_nodes(self):
+        lens = Lens(self.dir.name, max_depth=1)
+        lens.infer(
+            [
+                {"user": {"name": "ann", "addr": {"city": "x"}}},
+                {"user": {"name": "bob"}},
+            ]
+        )
+        root = lens.schema()
+        user = root["fields"]["user"]["types"]["object"]
+        # Depth 1 stays exact; the deeper addr subtree is collapsed.
+        self.assertNotIn("approximate", user)
+        self.assertEqual(user["count"], 2)
+        self.assertEqual(user["fields"]["name"]["observed"], 2)
+        addr = user["fields"]["addr"]["types"]["object"]
+        self.assertTrue(addr["approximate"])
+        self.assertNotIn("fields", addr)
+        self.assertEqual(addr["count"], 1)
+        self.assertEqual(lens.stats()["approximate"], ["$.user.addr"])
+        # Checking does not descend into the collapsed subtree.
+        self.assertEqual(
+            lens.check({"user": {"name": "n", "addr": {"anything": [1, {}]}}}), []
+        )
+
+    def test_depth_cap_collapses_array_elements(self):
+        lens = Lens(self.dir.name, max_depth=1)
+        lens.infer([{"items": [{"x": 1}, {"x": 2}]}])
+        items = lens.schema()["fields"]["items"]["types"]["array"]
+        self.assertNotIn("approximate", items)
+        element = items["elements"]["object"]
+        self.assertTrue(element["approximate"])
+        self.assertEqual(element["count"], 2)
+
+    def test_stats_lists_overflow_location(self):
+        lens = Lens(self.dir.name, max_fields=1)
+        lens.infer([{"a": 1, "b": 2}])
+        self.assertEqual(lens.stats()["approximate"], ['$["*"]'])
+
+    def test_approximation_survives_save_and_load(self):
+        lens = Lens(self.dir.name, max_fields=1, max_depth=1)
+        lens.infer([{"a": 1, "b": {"c": 2}}])
+        lens.save()
+        reloaded = Lens(self.dir.name)
+        reloaded.load()
+        self.assertEqual(reloaded.schema(), lens.schema())
+        self.assertEqual(reloaded.stats()["approximate"], lens.stats()["approximate"])
+        # Appending after reload keeps the overflow monotone.
+        reloaded2 = Lens(self.dir.name, max_fields=1, max_depth=1)
+        reloaded2.load()
+        reloaded2.infer([{"a": 2, "d": "x"}])
+        reloaded2.save()
+        final = Lens(self.dir.name)
+        final.load()
+        self.assertEqual(final.schema()["overflow"]["observed"], 2)
+
+    def test_limited_batches_still_commit_incrementally(self):
+        batches = [
+            [{"a": 1, "b": 1}, {"a": 2, "c": "x"}],
+            [{"a": 3, "b": 2, "d": None}],
+        ]
+        lens = Lens(self.dir.name, max_fields=2)
+        for batch in batches:
+            lens.infer(batch)
+            lens.save()
+        reloaded = Lens(self.dir.name)
+        reloaded.load()
+        self.assertEqual(reloaded.stats()["records"], 3)
+        self.assertEqual(sorted(reloaded.schema()["fields"]), ["a", "b"])
+        self.assertEqual(reloaded.schema()["overflow"]["observed"], 2)
+
+    def test_invalid_limits_rejected(self):
+        with self.assertRaises(ValueError):
+            Lens(self.dir.name, max_fields=-1)
+        with self.assertRaises(ValueError):
+            Lens(self.dir.name, max_depth=1.5)
+        with self.assertRaises(ValueError):
+            Lens(self.dir.name, max_fields=True)
+
+    def test_dotted_keys_still_located_with_limits(self):
+        lens = Lens(self.dir.name, max_fields=5)
+        lens.infer([{"a.b": 1, "a": {"b": 2}}])
+        reports = lens.check({"a.b": "x", "a": {"b": "x"}})
+        self.assertIn('$["a.b"]: type string not in field types [number]', reports)
+        self.assertIn("$.a.b: type string not in field types [number]", reports)
+
+    def test_record_stream_is_not_retained(self):
+        # Folding a large stream keeps only the bounded statistics tree.
+        lens = Lens(self.dir.name, max_fields=3, max_depth=2)
+
+        def stream():
+            for index in range(20000):
+                yield {
+                    f"field{index % 40}": index,
+                    "nested": {"deep": {"deeper": {"leaf": index}}},
+                }
+
+        lens.infer(stream())
+        root = lens.schema()
+        self.assertLessEqual(len(root["fields"]), 3)
+        self.assertEqual(root["count"], 20000)
+        nested = root["fields"]["nested"]["types"]["object"]
+        self.assertNotIn("approximate", nested)
+        deeper = nested["fields"]["deep"]["types"]["object"]["fields"]["deeper"]
+        self.assertTrue(deeper["types"]["object"]["approximate"])
+
+
+class MigrationTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        lens = Lens(tempfile.mkdtemp())
+        lens.infer([{"a": 1, "b": "x"}, {"a": "s"}])
+        self.root = lens.schema()
+
+    def _write_version_one(self):
+        from schema_lens.core import _checksum
+
+        path = Path(self.dir.name, SCHEMA_FILENAME)
+        payload = {"version": 1, "checksum": _checksum(self.root), "root": self.root}
+        path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+        return path
+
+    def test_version_one_file_migrates_on_load(self):
+        from schema_lens.core import _checksum
+
+        path = self._write_version_one()
+        lens = Lens(self.dir.name)
+        lens.load()
+        self.assertEqual(lens.schema(), self.root)
+        migrated = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(migrated["version"], SCHEMA_VERSION)
+        self.assertEqual(migrated["checksum"], _checksum(migrated["root"]))
+        self.assertEqual(migrated["root"], self.root)
+
+    def test_version_one_file_migrates_on_save_and_keeps_batches(self):
+        self._write_version_one()
+        lens = Lens(self.dir.name)
+        lens.load()
+        lens.infer([{"c": True}])
+        lens.save()
+        reloaded = Lens(self.dir.name)
+        reloaded.load()
+        self.assertEqual(reloaded.stats()["records"], 3)
+        self.assertEqual(sorted(reloaded.schema()["fields"]), ["a", "b", "c"])
+        payload = json.loads(Path(self.dir.name, SCHEMA_FILENAME).read_text())
+        self.assertEqual(payload["version"], SCHEMA_VERSION)
+
+    def test_failed_migration_preserves_file_and_memory(self):
+        from unittest import mock
+
+        path = self._write_version_one()
+        before = path.read_bytes()
+        lens = Lens(self.dir.name)
+        with mock.patch(
+            "schema_lens.core._write_payload", side_effect=OSError("disk full")
+        ):
+            with self.assertRaises(SchemaConflict):
+                lens.load()
+        # The original file is untouched and memory holds no schema.
+        self.assertEqual(path.read_bytes(), before)
+        with self.assertRaises(SchemaConflict):
+            lens.schema()
+        # The read can be retried later and migrates cleanly.
+        lens.load()
+        self.assertEqual(lens.schema(), self.root)
+        self.assertEqual(
+            json.loads(path.read_text(encoding="utf-8"))["version"], SCHEMA_VERSION
+        )
+
+    def test_failed_migration_during_save_preserves_memory(self):
+        from unittest import mock
+
+        self._write_version_one()
+        lens = Lens(self.dir.name)
+        lens.infer([{"c": 1}])
+        memory = lens.schema()
+        with mock.patch(
+            "schema_lens.core._write_payload", side_effect=OSError("read-only")
+        ):
+            with self.assertRaises(SchemaConflict):
+                lens.save()
+        self.assertEqual(lens.schema(), memory)
+        # The version 1 file is still there, so the retry migrates and
+        # commits the held delta on top of it.
+        lens.save()
+        reloaded = Lens(self.dir.name)
+        reloaded.load()
+        self.assertEqual(reloaded.stats()["records"], 3)
+        self.assertEqual(sorted(reloaded.schema()["fields"]), ["a", "b", "c"])
+
+    def test_migrated_schema_equivalent_to_fresh_fold(self):
+        self._write_version_one()
+        migrated = Lens(self.dir.name)
+        migrated.load()
+        fresh = Lens(tempfile.mkdtemp())
+        fresh.infer([{"a": 1, "b": "x"}, {"a": "s"}])
+        self.assertEqual(migrated.schema(), fresh.schema())
+
+
+class StreamingCliTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.lens_dir = str(Path(self.dir.name, "lens"))
+        self.records = str(Path(self.dir.name, "records.jsonl"))
+
+    def _write(self, records):
+        with open(self.records, "w", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(json.dumps(record) + "\n")
+
+    def _run(self, *argv):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = cli_main(list(argv))
+        return code, out.getvalue()
+
+    def test_cli_infer_with_limits_marks_approximation(self):
+        self._write([{"a": 1, "b": 2, "c": 3}, {"a": 4, "b": 5, "c": 6}])
+        code, out = self._run(
+            "--path", self.lens_dir, "--max-fields", "2", "infer", self.records
+        )
+        self.assertEqual(code, 0)
+        stats = json.loads(out)
+        self.assertEqual(stats["records"], 2)
+        self.assertEqual(stats["approximate"], ['$["*"]'])
+        code, out = self._run("--path", self.lens_dir, "show")
+        self.assertEqual(code, 0)
+        schema = json.loads(out)
+        self.assertTrue(schema["overflow"]["approximate"])
+        self.assertEqual(sorted(schema["fields"]), ["a", "b"])
+
+    def test_cli_infer_without_limits_has_no_approximation(self):
+        self._write([{"a": 1}, {"a": 2, "b": "x"}])
+        code, out = self._run("--path", self.lens_dir, "infer", self.records)
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out)["approximate"], [])
+
+    def test_cli_check_exit_codes_unchanged_with_limits(self):
+        self._write([{"a": 1, "b": 2}])
+        self._run("--path", self.lens_dir, "--max-fields", "1", "infer", self.records)
+        self._write([{"a": 2, "b": 3, "c": 4}])
+        code, _ = self._run("--path", self.lens_dir, "check", self.records)
+        self.assertEqual(code, 0)
+        self._write([{"a": "bad"}])
+        code, out = self._run("--path", self.lens_dir, "check", self.records)
+        self.assertEqual(code, 1)
+        self.assertIn("$.a: type string not in field types [number]", out)
+
+
 if __name__ == "__main__":
     unittest.main()

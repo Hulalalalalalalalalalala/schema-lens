@@ -5,12 +5,14 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from typing import Iterator
 
 from .core import Lens, SchemaConflict
 
 
-def _read_records(path: str) -> list:
-    records = []
+def _iter_records(path: str) -> Iterator[dict]:
+    """Yield records one at a time so streams of any size can be folded
+    without ever holding the file's contents in memory."""
     try:
         handle = open(path, "r", encoding="utf-8")
     except OSError as exc:
@@ -26,8 +28,11 @@ def _read_records(path: str) -> list:
                 raise ValueError(f"{path}:{lineno}: invalid JSON: {exc}") from exc
             if not isinstance(record, dict):
                 raise ValueError(f"{path}:{lineno}: record is not a JSON object")
-            records.append(record)
-    return records
+            yield record
+
+
+def _read_records(path: str) -> list:
+    return list(_iter_records(path))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -36,16 +41,28 @@ def main(argv: list[str] | None = None) -> int:
         description="Infer a schema from JSON records and validate against it.",
     )
     parser.add_argument("--path", required=True, help="lens directory")
+    parser.add_argument(
+        "--max-fields",
+        type=int,
+        default=None,
+        help="cap exactly tracked fields per object; overflow is approximated",
+    )
+    parser.add_argument(
+        "--max-depth",
+        type=int,
+        default=None,
+        help="cap nesting depth of tracked nodes; deeper subtrees are approximated",
+    )
     parser.add_argument("command", choices=["infer", "check", "show"])
     parser.add_argument("records", nargs="?", help="JSONL records file")
     args = parser.parse_args(argv)
 
-    lens = Lens(args.path)
+    lens = Lens(args.path, max_fields=args.max_fields, max_depth=args.max_depth)
     try:
         if args.command == "infer":
             if not args.records:
                 parser.error("infer requires a records file")
-            lens.infer(_read_records(args.records))
+            lens.infer(_iter_records(args.records))
             lens.save()
             json.dump(lens.stats(), sys.stdout, indent=2, sort_keys=True)
             sys.stdout.write("\n")
@@ -55,7 +72,7 @@ def main(argv: list[str] | None = None) -> int:
                 parser.error("check requires a records file")
             lens.load()
             problems = 0
-            for lineno, record in enumerate(_read_records(args.records), 1):
+            for lineno, record in enumerate(_iter_records(args.records), 1):
                 for report in lens.check(record):
                     problems += 1
                     print(f"line {lineno}: {report}")
