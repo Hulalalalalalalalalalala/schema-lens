@@ -53,11 +53,38 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="cap nesting depth of tracked nodes; deeper subtrees are approximated",
     )
-    parser.add_argument("command", choices=["infer", "check", "show"])
-    parser.add_argument("records", nargs="?", help="JSONL records file")
+    parser.add_argument(
+        "--keep-versions",
+        type=int,
+        default=10,
+        help="retain at most this many complete revisions; older ones are compacted",
+    )
+    parser.add_argument(
+        "--version",
+        dest="revision",
+        type=int,
+        default=None,
+        help="revision to read for check/show (default: the snapshot opened at load)",
+    )
+    parser.add_argument(
+        "command", choices=["infer", "check", "show", "versions", "rollback"]
+    )
+    parser.add_argument(
+        "records",
+        nargs="?",
+        help="JSONL records file (infer/check) or revision number (rollback)",
+    )
     args = parser.parse_args(argv)
 
-    lens = Lens(args.path, max_fields=args.max_fields, max_depth=args.max_depth)
+    if args.revision is not None and args.command not in ("check", "show"):
+        parser.error("--version only applies to check and show")
+
+    lens = Lens(
+        args.path,
+        max_fields=args.max_fields,
+        max_depth=args.max_depth,
+        keep_versions=args.keep_versions,
+    )
     try:
         if args.command == "infer":
             if not args.records:
@@ -70,16 +97,31 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "check":
             if not args.records:
                 parser.error("check requires a records file")
-            lens.load()
+            lens.load(version=args.revision)
             problems = 0
             for lineno, record in enumerate(_iter_records(args.records), 1):
                 for report in lens.check(record):
                     problems += 1
                     print(f"line {lineno}: {report}")
             return 1 if problems else 0
-        lens.load()
-        json.dump(lens.schema(), sys.stdout, indent=2, sort_keys=True)
-        sys.stdout.write("\n")
+        if args.command == "show":
+            lens.load(version=args.revision)
+            json.dump(lens.schema(), sys.stdout, indent=2, sort_keys=True)
+            sys.stdout.write("\n")
+            return 0
+        if args.command == "versions":
+            for revision in lens.versions():
+                print(revision)
+            return 0
+        # rollback
+        if args.records is None:
+            parser.error("rollback requires a revision number")
+        try:
+            target = int(args.records)
+        except ValueError:
+            parser.error("rollback revision must be an integer")
+        new_revision = lens.rollback(target)
+        print(new_revision)
         return 0
     except SchemaConflict as exc:
         print(f"schema_lens: {exc}", file=sys.stderr)
