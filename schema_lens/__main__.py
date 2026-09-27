@@ -5,29 +5,48 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from typing import Iterator
 
 from .core import Lens, SchemaConflict
 
 
-def _read_records(path: str) -> list:
-    records = []
-    try:
-        handle = open(path, "r", encoding="utf-8")
-    except OSError as exc:
-        raise ValueError(f"{path}: cannot read records file: {exc}") from exc
-    with handle:
-        for lineno, line in enumerate(handle, 1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError as exc:
-                raise ValueError(f"{path}:{lineno}: invalid JSON: {exc}") from exc
-            if not isinstance(record, dict):
-                raise ValueError(f"{path}:{lineno}: record is not a JSON object")
-            records.append(record)
-    return records
+class _RecordReader:
+    """Streams JSON object records from a JSONL file, one line at a time.
+
+    The file is opened eagerly so a missing or unreadable file raises
+    ValueError at construction; the records themselves are parsed lazily as
+    the reader is iterated, so arbitrarily large record streams fold
+    without ever being held in memory.
+    """
+
+    def __init__(self, path: str) -> None:
+        self._path = path
+        try:
+            self._handle = open(path, "r", encoding="utf-8")
+        except OSError as exc:
+            raise ValueError(f"{path}: cannot read records file: {exc}") from exc
+
+    def __iter__(self) -> Iterator[dict]:
+        with self._handle:
+            for lineno, line in enumerate(self._handle, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(
+                        f"{self._path}:{lineno}: invalid JSON: {exc}"
+                    ) from exc
+                if not isinstance(record, dict):
+                    raise ValueError(
+                        f"{self._path}:{lineno}: record is not a JSON object"
+                    )
+                yield record
+
+
+def _read_records(path: str) -> _RecordReader:
+    return _RecordReader(path)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -55,7 +74,8 @@ def main(argv: list[str] | None = None) -> int:
                 parser.error("check requires a records file")
             lens.load()
             problems = 0
-            for lineno, record in enumerate(_read_records(args.records), 1):
+            reader = _read_records(args.records)
+            for lineno, record in enumerate(reader, 1):
                 for report in lens.check(record):
                     problems += 1
                     print(f"line {lineno}: {report}")
