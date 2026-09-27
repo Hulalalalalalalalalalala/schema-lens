@@ -53,32 +53,99 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="cap nesting depth of tracked nodes; deeper subtrees are approximated",
     )
-    parser.add_argument("command", choices=["infer", "check", "show"])
-    parser.add_argument("records", nargs="?", help="JSONL records file")
-    args = parser.parse_args(argv)
+    parser.add_argument(
+        "--max-versions",
+        type=int,
+        default=None,
+        help="keep at most this many complete revisions; older ones are pruned",
+    )
+    parser.add_argument(
+        "--version",
+        type=int,
+        default=None,
+        dest="revision",
+        help="revision number to check against or show (default: the open snapshot)",
+    )
+    parser.add_argument(
+        "command", choices=["infer", "check", "show", "versions", "rollback"]
+    )
+    parser.add_argument(
+        "target",
+        nargs="?",
+        help="JSONL records file (infer/check) or revision number (rollback)",
+    )
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as exc:
+        # argparse already printed the usage error; keep the command's
+        # exit-code contract instead of unwinding through the caller.
+        return exc.code if isinstance(exc.code, int) else 2
 
-    lens = Lens(args.path, max_fields=args.max_fields, max_depth=args.max_depth)
+    def fail(message: str) -> int:
+        parser.print_usage(sys.stderr)
+        print(f"{parser.prog}: error: {message}", file=sys.stderr)
+        return 2
+
+    if args.revision is not None and args.command not in ("check", "show"):
+        return fail("--version is only valid with check and show")
+    if args.command in ("infer", "check") and not args.target:
+        return fail(f"{args.command} requires a records file")
+    rollback_revision: int | None = None
+    if args.command == "rollback":
+        if args.target is None:
+            return fail("rollback requires a revision number")
+        try:
+            rollback_revision = int(args.target)
+        except ValueError:
+            return fail("rollback revision must be an integer")
+
+    lens_kwargs = {}
+    if args.max_versions is not None:
+        lens_kwargs["max_versions"] = args.max_versions
+    lens = Lens(
+        args.path,
+        max_fields=args.max_fields,
+        max_depth=args.max_depth,
+        **lens_kwargs,
+    )
     try:
         if args.command == "infer":
-            if not args.records:
-                parser.error("infer requires a records file")
-            lens.infer(_iter_records(args.records))
+            lens.infer(_iter_records(args.target))
             lens.save()
             json.dump(lens.stats(), sys.stdout, indent=2, sort_keys=True)
             sys.stdout.write("\n")
             return 0
         if args.command == "check":
-            if not args.records:
-                parser.error("check requires a records file")
-            lens.load()
+            if args.revision is None:
+                lens.load()
             problems = 0
-            for lineno, record in enumerate(_iter_records(args.records), 1):
-                for report in lens.check(record):
+            for lineno, record in enumerate(_iter_records(args.target), 1):
+                for report in lens.check(record, version=args.revision):
                     problems += 1
                     print(f"line {lineno}: {report}")
             return 1 if problems else 0
-        lens.load()
-        json.dump(lens.schema(), sys.stdout, indent=2, sort_keys=True)
+        if args.command == "show":
+            if args.revision is None:
+                lens.load()
+            json.dump(
+                lens.schema(version=args.revision),
+                sys.stdout,
+                indent=2,
+                sort_keys=True,
+            )
+            sys.stdout.write("\n")
+            return 0
+        if args.command == "versions":
+            json.dump(lens.versions(), sys.stdout)
+            sys.stdout.write("\n")
+            return 0
+        # rollback: the target schema is committed again as a new revision.
+        new_revision = lens.rollback(rollback_revision)
+        json.dump(
+            {"rolled_back_to": rollback_revision, "revision": new_revision},
+            sys.stdout,
+            sort_keys=True,
+        )
         sys.stdout.write("\n")
         return 0
     except SchemaConflict as exc:

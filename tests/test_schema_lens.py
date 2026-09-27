@@ -4,18 +4,30 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 
 from schema_lens import Lens, SchemaConflict
 from schema_lens.__main__ import _read_records, main as cli_main
-from schema_lens.core import LOCK_FILENAME, SCHEMA_FILENAME, SCHEMA_VERSION
+from schema_lens.core import (
+    DEFAULT_MAX_VERSIONS,
+    LOCK_FILENAME,
+    OVERFLOW_MARKER,
+    SCHEMA_FILENAME,
+    SCHEMA_VERSION,
+    VERSIONS_DIRNAME,
+)
 
 try:
     import fcntl
 except ImportError:
     fcntl = None
+
+
+def revision_path(directory: str, revision: int) -> Path:
+    return Path(directory, VERSIONS_DIRNAME, f"revision-{revision:010d}.json")
 
 
 class InferTests(unittest.TestCase):
@@ -135,8 +147,16 @@ class CheckTests(unittest.TestCase):
         with self.assertRaises(SchemaConflict):
             Lens(self.dir.name).schema()
 
+    def test_pinned_version_without_any_schema_raises(self):
+        # An explicit revision is read from disk, so it conflicts even
+        # though no in-memory schema is required for that read shape.
+        with self.assertRaises(SchemaConflict):
+            Lens(self.dir.name).check({"a": 1}, version=1)
+        with self.assertRaises(SchemaConflict):
+            Lens(self.dir.name).schema(version=1)
 
-class PersistenceTests(unittest.TestCase):
+
+class RevisionPersistenceTests(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.dir.cleanup)
@@ -149,6 +169,42 @@ class PersistenceTests(unittest.TestCase):
         reloaded.load()
         self.assertEqual(reloaded.schema(), lens.schema())
 
+    def test_every_commit_writes_a_new_complete_revision(self):
+        lens = Lens(self.dir.name)
+        lens.infer([{"a": 1}])
+        lens.save()
+        lens.infer([{"b": "x"}])
+        lens.save()
+        lens.infer([{"c": True}])
+        lens.save()
+        self.assertEqual(lens.versions(), [1, 2, 3])
+        for revision in (1, 2, 3):
+            path = revision_path(self.dir.name, revision)
+            self.assertTrue(path.exists())
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["version"], SCHEMA_VERSION)
+            self.assertEqual(payload["revision"], revision)
+            self.assertEqual(len(payload["checksum"]), 64)
+            self.assertTrue(all(c in "0123456789abcdef" for c in payload["checksum"]))
+
+    def test_committed_revisions_are_never_rewritten(self):
+        lens = Lens(self.dir.name)
+        lens.infer([{"a": 1}])
+        lens.save()
+        first = revision_path(self.dir.name, 1).read_bytes()
+        lens.infer([{"b": "x"}])
+        lens.save()
+        lens.infer([{"c": True}])
+        lens.save()
+        self.assertEqual(revision_path(self.dir.name, 1).read_bytes(), first)
+
+    def test_versions_empty_before_any_commit(self):
+        self.assertEqual(Lens(self.dir.name).versions(), [])
+
+    def test_load_missing_revisions_raises(self):
+        with self.assertRaises(SchemaConflict):
+            Lens(self.dir.name).load()
+
     def test_load_replaces_memory_wholesale(self):
         lens = Lens(self.dir.name)
         lens.infer([{"a": 1}])
@@ -157,34 +213,93 @@ class PersistenceTests(unittest.TestCase):
         lens.load()
         self.assertEqual(sorted(lens.schema()["fields"]), ["a"])
 
-    def test_load_missing_file_raises(self):
-        with self.assertRaises(SchemaConflict):
-            Lens(self.dir.name).load()
-
-    def test_load_corrupt_file_raises_and_preserves_memory(self):
+    def test_load_replaces_memory_wholesale_with_pinned_revision(self):
         lens = Lens(self.dir.name)
         lens.infer([{"a": 1}])
-        before = lens.schema()
-        Path(self.dir.name, "schema.json").write_text("{not json", encoding="utf-8")
-        with self.assertRaises(SchemaConflict):
-            lens.load()
-        self.assertEqual(lens.schema(), before)
-
-    def test_load_malformed_schema_raises_and_preserves_memory(self):
-        lens = Lens(self.dir.name)
-        lens.infer([{"a": 1}])
-        before = lens.schema()
-        Path(self.dir.name, "schema.json").write_text(
-            json.dumps({"root": {"kind": "object", "fields": "oops"}}),
-            encoding="utf-8",
-        )
-        with self.assertRaises(SchemaConflict):
-            lens.load()
-        self.assertEqual(lens.schema(), before)
+        lens.save()
+        lens.infer([{"b": 2}])
+        lens.save()
+        lens.load(version=1)
+        self.assertEqual(sorted(lens.schema()["fields"]), ["a"])
 
     def test_save_without_schema_raises(self):
         with self.assertRaises(SchemaConflict):
             Lens(self.dir.name).save()
+
+    def test_successful_commit_leaves_no_temp_file(self):
+        lens = Lens(self.dir.name)
+        lens.infer([{"a": 1}])
+        lens.save()
+        names = os.listdir(Path(self.dir.name, VERSIONS_DIRNAME))
+        self.assertEqual(names, ["revision-0000000001.json"])
+
+    def test_explicit_revision_reads_that_version_only(self):
+        lens = Lens(self.dir.name)
+        lens.infer([{"a": 1}])
+        lens.save()
+        lens.infer([{"b": "x"}])
+        lens.save()
+        reader = Lens(self.dir.name)
+        reader.load()
+        snapshot = reader.schema()
+        self.assertEqual(set(reader.schema(version=1)["fields"]), {"a"})
+        self.assertEqual(set(reader.schema(version=2)["fields"]), {"a", "b"})
+        # Pinned reads do not move the open snapshot.
+        self.assertEqual(reader.schema(), snapshot)
+
+    def test_pinned_check_uses_the_requested_revision(self):
+        lens = Lens(self.dir.name)
+        lens.infer([{"a": 1}])
+        lens.save()
+        lens.infer([{"b": "x"}])
+        lens.save()
+        reader = Lens(self.dir.name)
+        reader.load()
+        # b exists only in revision 2.
+        self.assertEqual(reader.check({"a": 2, "b": "y"}, version=2), [])
+        reports = reader.check({"a": 2, "b": "y"}, version=1)
+        self.assertIn("$.b: unexpected field", reports)
+        # Open snapshot is still revision 2.
+        self.assertEqual(reader.check({"a": 2, "b": "y"}), [])
+
+    def test_missing_explicit_revision_raises_and_keeps_others_usable(self):
+        lens = Lens(self.dir.name)
+        lens.infer([{"a": 1}])
+        lens.save()
+        lens.infer([{"b": "x"}])
+        lens.save()
+        reader = Lens(self.dir.name)
+        reader.load()
+        before = reader.schema()
+        with self.assertRaises(SchemaConflict):
+            reader.schema(version=3)
+        with self.assertRaises(SchemaConflict):
+            reader.check({"a": 1}, version=99)
+        # The open snapshot and surviving revisions stay usable.
+        self.assertEqual(reader.schema(), before)
+        self.assertEqual(reader.schema(version=1), reader.schema(version=1))
+        self.assertEqual(set(reader.schema(version=2)["fields"]), {"a", "b"})
+
+    def test_pruned_revision_reads_as_missing(self):
+        lens = Lens(self.dir.name, max_versions=2)
+        for index in range(4):
+            lens.infer([{f"f{index}": index}])
+            lens.save()
+        self.assertEqual(lens.versions(), [3, 4])
+        with self.assertRaises(SchemaConflict):
+            lens.schema(version=1)
+        with self.assertRaises(SchemaConflict):
+            lens.load(version=2)
+        self.assertEqual(lens.schema(version=4), lens.schema())
+
+    def test_default_retention_binding(self):
+        lens = Lens(self.dir.name)
+        self.assertEqual(lens.max_versions, DEFAULT_MAX_VERSIONS)
+
+    def test_invalid_max_versions_rejected(self):
+        for bad in (0, -1, 1.5, True):
+            with self.assertRaises(ValueError):
+                Lens(self.dir.name, max_versions=bad)
 
 
 _WORKER = """
@@ -273,8 +388,6 @@ class IncrementalPersistenceTests(unittest.TestCase):
         self.assertEqual(fields["a"]["total"], 4)
         elements = fields["c"]["types"]["array"]["elements"]
         self.assertEqual(set(elements), {"null", "number"})
-        # A record without the sparsely observed fields still matches, but a
-        # wrong value for the always-present field a is still reported.
         self.assertEqual(reloaded.check({}), [])
         self.assertEqual(
             reloaded.check({"a": "s", "b": "x", "c": []}),
@@ -343,73 +456,84 @@ class IncrementalPersistenceTests(unittest.TestCase):
         all_records = [record for batch in batches for record in batch]
         self.assertEqual(reloaded.schema(), _fold_all(all_records))
         self.assertEqual(reloaded.stats()["records"], 6)
+        self.assertEqual(reloaded.versions(), [1, 2, 3])
 
 
-class ChecksummedFileTests(unittest.TestCase):
+class RevisionIntegrityTests(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.dir.cleanup)
         self.lens = Lens(self.dir.name)
         self.lens.infer([{"a": 1, "b": "x"}, {"a": "s"}])
         self.lens.save()
-
-    def test_file_carries_version_and_checksum_of_schema(self):
-        payload = json.loads(Path(self.dir.name, SCHEMA_FILENAME).read_text())
-        self.assertEqual(payload["version"], SCHEMA_VERSION)
-        self.assertEqual(len(payload["checksum"]), 64)
-        self.assertTrue(all(c in "0123456789abcdef" for c in payload["checksum"]))
+        self.lens.infer([{"c": True}])
+        self.lens.save()
 
     def test_checksum_mismatch_raises_and_preserves_memory(self):
-        path = Path(self.dir.name, SCHEMA_FILENAME)
+        path = revision_path(self.dir.name, 2)
         payload = json.loads(path.read_text())
         payload["root"]["count"] += 100
         path.write_text(json.dumps(payload), encoding="utf-8")
         before = self.lens.schema()
         with self.assertRaises(SchemaConflict):
-            self.lens.load()
+            self.lens.schema(version=2)
+        with self.assertRaises(SchemaConflict):
+            Lens(self.dir.name).load()
         self.assertEqual(self.lens.schema(), before)
 
-    def test_rewritten_checksum_raises_and_preserves_memory(self):
-        path = Path(self.dir.name, SCHEMA_FILENAME)
+    def test_rewritten_checksum_raises(self):
+        path = revision_path(self.dir.name, 2)
         payload = json.loads(path.read_text())
         payload["checksum"] = "0" * 64
         path.write_text(json.dumps(payload), encoding="utf-8")
-        before = self.lens.schema()
         with self.assertRaises(SchemaConflict):
-            self.lens.load()
-        self.assertEqual(self.lens.schema(), before)
+            self.lens.schema(version=2)
 
-    def test_unknown_version_raises_and_preserves_memory(self):
-        path = Path(self.dir.name, SCHEMA_FILENAME)
+    def test_unknown_format_version_raises(self):
+        path = revision_path(self.dir.name, 2)
         payload = json.loads(path.read_text())
         payload["version"] = 999
         path.write_text(json.dumps(payload), encoding="utf-8")
-        before = self.lens.schema()
         with self.assertRaises(SchemaConflict):
-            self.lens.load()
-        self.assertEqual(self.lens.schema(), before)
+            self.lens.schema(version=2)
 
-    def test_truncated_half_file_raises_and_preserves_memory(self):
-        path = Path(self.dir.name, SCHEMA_FILENAME)
+    def test_revision_number_mismatch_raises(self):
+        path = revision_path(self.dir.name, 2)
+        payload = json.loads(path.read_text())
+        payload["revision"] = 5
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        with self.assertRaises(SchemaConflict):
+            self.lens.schema(version=2)
+
+    def test_truncated_half_file_raises(self):
+        path = revision_path(self.dir.name, 2)
         raw = path.read_text(encoding="utf-8")
         path.write_text(raw[: len(raw) // 2], encoding="utf-8")
-        before = self.lens.schema()
         with self.assertRaises(SchemaConflict):
-            self.lens.load()
-        self.assertEqual(self.lens.schema(), before)
+            self.lens.schema(version=2)
 
-    def test_successful_commit_leaves_no_half_file(self):
-        names = set(os.listdir(self.dir.name))
-        self.assertIn(SCHEMA_FILENAME, names)
-        self.assertNotIn(SCHEMA_FILENAME + ".tmp", names)
-        # A stale temp file from a crashed writer never masks the full schema.
-        Path(self.dir.name, SCHEMA_FILENAME + ".tmp").write_text("{half", encoding="utf-8")
+    def test_one_corrupt_revision_leaves_others_usable(self):
+        path = revision_path(self.dir.name, 2)
+        path.write_text("{broken", encoding="utf-8")
+        # Revision 1 still reads cleanly.
+        root = self.lens.schema(version=1)
+        self.assertEqual(set(root["fields"]), {"a", "b"})
+        # The newest revision being corrupt makes unqualified reads fail.
+        with self.assertRaises(SchemaConflict):
+            Lens(self.dir.name).load()
+        with self.assertRaises(SchemaConflict):
+            self.lens.save()
+
+    def test_stale_temp_file_never_masks_revisions(self):
+        Path(self.dir.name, VERSIONS_DIRNAME,
+             "revision-0000000002.json.tmp").write_text("{half", encoding="utf-8")
         reloaded = Lens(self.dir.name)
         reloaded.load()
+        self.assertEqual(reloaded.versions(), [1, 2])
         self.assertEqual(reloaded.schema(), self.lens.schema())
 
-    def test_save_against_corrupt_disk_raises_and_preserves_memory(self):
-        from schema_lens.core import SCHEMA_VERSION, _checksum
+    def test_save_against_corrupt_head_raises_and_preserves_memory(self):
+        from schema_lens.core import _checksum
 
         with tempfile.TemporaryDirectory() as clean:
             lens = Lens(clean)
@@ -418,15 +542,15 @@ class ChecksummedFileTests(unittest.TestCase):
             first_batch = lens.schema()
             lens.infer([{"b": 2}])
             memory = lens.schema()
-            Path(clean, SCHEMA_FILENAME).write_text("{broken", encoding="utf-8")
+            revision_path(clean, 1).write_text("{broken", encoding="utf-8")
             with self.assertRaises(SchemaConflict):
                 lens.save()
             self.assertEqual(lens.schema(), memory)
-            # Once disk is healthy again, retrying commits the held delta.
-            Path(clean, SCHEMA_FILENAME).write_text(
+            revision_path(clean, 1).write_text(
                 json.dumps(
                     {
                         "version": SCHEMA_VERSION,
+                        "revision": 1,
                         "checksum": _checksum(first_batch),
                         "root": first_batch,
                     }
@@ -438,6 +562,183 @@ class ChecksummedFileTests(unittest.TestCase):
             reloaded.load()
             self.assertEqual(reloaded.stats()["records"], 2)
             self.assertEqual(set(reloaded.schema()["fields"]), {"a", "b"})
+            self.assertEqual(reloaded.versions(), [1, 2])
+
+
+class RetentionTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+
+    def test_prunes_oldest_above_bound(self):
+        lens = Lens(self.dir.name, max_versions=3)
+        for index in range(6):
+            lens.infer([{f"f{index}": index}])
+            lens.save()
+        self.assertEqual(lens.versions(), [4, 5, 6])
+        names = os.listdir(Path(self.dir.name, VERSIONS_DIRNAME))
+        self.assertEqual(
+            sorted(names),
+            [f"revision-{n:010d}.json" for n in (4, 5, 6)],
+        )
+
+    def test_bound_of_one_keeps_only_newest(self):
+        lens = Lens(self.dir.name, max_versions=1)
+        for index in range(4):
+            lens.infer([{f"f{index}": index}])
+            lens.save()
+        self.assertEqual(lens.versions(), [4])
+
+    def test_bound_does_not_delete_unrelated_files(self):
+        lens = Lens(self.dir.name, max_versions=1)
+        lens.infer([{"a": 1}])
+        lens.save()
+        keep = Path(self.dir.name, VERSIONS_DIRNAME, "notes.txt")
+        keep.write_text("handmade", encoding="utf-8")
+        lens.infer([{"b": 2}])
+        lens.save()
+        self.assertTrue(keep.exists())
+
+    def test_new_commits_after_pruning_keep_monotonic_numbers(self):
+        lens = Lens(self.dir.name, max_versions=2)
+        for index in range(5):
+            lens.infer([{f"f{index}": index}])
+            lens.save()
+        self.assertEqual(lens.versions(), [4, 5])
+        lens.infer([{"f5": 5}])
+        lens.save()
+        self.assertEqual(lens.versions(), [5, 6])
+
+
+class RollbackTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.lens = Lens(self.dir.name)
+        self.lens.infer([{"a": 1}])
+        self.lens.save()
+        self.lens.infer([{"b": "x"}])
+        self.lens.save()
+        self.lens.infer([{"c": True}])
+        self.lens.save()
+
+    def test_rollback_appends_a_new_revision(self):
+        new_revision = self.lens.rollback(1)
+        self.assertEqual(new_revision, 4)
+        self.assertEqual(self.lens.versions(), [1, 2, 3, 4])
+        # History is untouched.
+        self.assertEqual(
+            set(self.lens.schema(version=3)["fields"]), {"a", "b", "c"}
+        )
+        # The new revision is equivalent to the target.
+        target = self.lens.schema(version=1)
+        self.assertEqual(self.lens.schema(version=4), target)
+        self.assertEqual(self.lens.schema(), target)
+
+    def test_rollback_schema_equivalent_to_target_under_load(self):
+        self.lens.rollback(2)
+        reloaded = Lens(self.dir.name)
+        reloaded.load()
+        self.assertEqual(reloaded.schema(), reloaded.schema(version=2))
+
+    def test_rollback_to_missing_revision_raises_and_changes_nothing(self):
+        before = self.lens.versions()
+        with self.assertRaises(SchemaConflict):
+            self.lens.rollback(99)
+        self.assertEqual(self.lens.versions(), before)
+        newest_bytes = revision_path(self.dir.name, 3).read_bytes()
+        with self.assertRaises(SchemaConflict):
+            self.lens.rollback(0)
+        self.assertEqual(revision_path(self.dir.name, 3).read_bytes(), newest_bytes)
+
+    def test_rollback_to_pruned_revision_raises(self):
+        directory = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(directory,
+                                                            ignore_errors=True))
+        lens = Lens(directory, max_versions=2)
+        for index in range(4):
+            lens.infer([{f"f{index}": index}])
+            lens.save()
+        self.assertEqual(lens.versions(), [3, 4])
+        with self.assertRaises(SchemaConflict):
+            lens.rollback(1)
+        self.assertEqual(lens.versions(), [3, 4])
+
+    def test_rollback_to_corrupt_revision_raises_and_changes_nothing(self):
+        path = revision_path(self.dir.name, 1)
+        path.write_text("{broken", encoding="utf-8")
+        before = self.lens.versions()
+        with self.assertRaises(SchemaConflict):
+            self.lens.rollback(1)
+        self.assertEqual(self.lens.versions(), before)
+        self.assertFalse((Path(self.dir.name, VERSIONS_DIRNAME) /
+                          "revision-0000000004.json").exists())
+
+    def test_rollback_then_inference_builds_on_target(self):
+        self.lens.rollback(1)
+        self.lens.infer([{"d": None}])
+        self.lens.save()
+        reloaded = Lens(self.dir.name)
+        reloaded.load()
+        self.assertEqual(set(reloaded.schema()["fields"]), {"a", "d"})
+        self.assertEqual(reloaded.versions(), [1, 2, 3, 4, 5])
+
+    def test_rollback_respects_retention(self):
+        directory = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(directory,
+                                                            ignore_errors=True))
+        lens = Lens(directory, max_versions=3)
+        for index in range(4):
+            lens.infer([{f"f{index}": index}])
+            lens.save()
+        self.assertEqual(lens.versions(), [2, 3, 4])
+        lens.rollback(2)
+        self.assertEqual(lens.versions(), [3, 4, 5])
+
+
+class SnapshotTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+
+    def test_open_snapshot_is_not_affected_by_later_commits(self):
+        lens = Lens(self.dir.name)
+        lens.infer([{"a": 1}])
+        lens.save()
+        reader = Lens(self.dir.name)
+        reader.load()
+        other = Lens(self.dir.name)
+        other.load()
+        other.infer([{"b": "x"}, {"c": True}])
+        other.save()
+        # The open snapshot still answers as revision 1.
+        self.assertEqual(set(reader.schema()["fields"]), {"a"})
+        self.assertEqual(reader.check({"a": 2, "b": "y"}),
+                         ["$.b: unexpected field"])
+        # Explicit reads reach the committed newer revision.
+        self.assertEqual(set(reader.schema(version=2)["fields"]),
+                         {"a", "b", "c"})
+        reader.load()
+        self.assertEqual(set(reader.schema()["fields"]), {"a", "b", "c"})
+
+    def test_inference_appends_to_the_open_snapshot(self):
+        writer = Lens(self.dir.name)
+        writer.infer([{"a": 1}])
+        writer.save()
+        writer.infer([{"b": "x"}])
+        writer.save()
+        lens = Lens(self.dir.name)
+        lens.load(version=1)
+        lens.infer([{"z": None}])
+        # Snapshot delta fold: z joins revision 1's fields, not revision 2's.
+        self.assertEqual(set(lens.schema()["fields"]), {"a", "z"})
+        lens.save()
+        reloaded = Lens(self.dir.name)
+        reloaded.load()
+        # Saving builds on the committed newest (revision 2), so the result
+        # contains b from revision 2 as well.
+        self.assertEqual(set(reloaded.schema()["fields"]), {"a", "b", "z"})
+        self.assertEqual(reloaded.versions(), [1, 2, 3])
 
 
 @unittest.skipIf(fcntl is None, "flock is only available on POSIX")
@@ -448,12 +749,12 @@ class LockTests(unittest.TestCase):
         self.holder = Path(self.dir.name, "hold_lock.py")
         self.holder.write_text(_LOCK_HOLDER, encoding="utf-8")
 
-    def test_contended_lock_raises_conflict_without_touching_commit(self):
+    def test_contended_lock_raises_conflict_without_touching_commits(self):
         lens_dir = self.dir.name
         lens = Lens(lens_dir)
         lens.infer([{"a": 1}])
         lens.save()
-        before = Path(lens_dir, SCHEMA_FILENAME).read_bytes()
+        before = set(os.listdir(Path(lens_dir, VERSIONS_DIRNAME)))
         proc = subprocess.Popen(
             [sys.executable, str(self.holder), lens_dir, "3"],
             stdout=subprocess.PIPE,
@@ -465,10 +766,10 @@ class LockTests(unittest.TestCase):
             memory_at_commit = lens.schema()
             with self.assertRaises(SchemaConflict):
                 lens.save()
-            # The failed commit neither touched the stored file nor rolled
-            # back (nor published) the in-memory schema.
+            # The failed commit neither added a revision nor rolled back
+            # (nor published) the in-memory schema.
             self.assertEqual(
-                Path(lens_dir, SCHEMA_FILENAME).read_bytes(), before
+                set(os.listdir(Path(lens_dir, VERSIONS_DIRNAME))), before
             )
             self.assertEqual(lens.schema(), memory_at_commit)
         finally:
@@ -480,12 +781,28 @@ class LockTests(unittest.TestCase):
         self.assertEqual(reloaded.stats()["records"], 2)
         self.assertEqual(set(reloaded.schema()["fields"]), {"a", "b"})
 
+    def test_contended_rollback_raises_without_committing(self):
+        lens = Lens(self.dir.name)
+        lens.infer([{"a": 1}])
+        lens.save()
+        proc = subprocess.Popen(
+            [sys.executable, str(self.holder), self.dir.name, "3"],
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        self.assertEqual(proc.stdout.readline().strip(), "locked")
+        try:
+            with self.assertRaises(SchemaConflict):
+                lens.rollback(1)
+        finally:
+            proc.wait()
+            proc.stdout.close()
+        self.assertEqual(lens.versions(), [1])
+
     def test_two_threads_in_one_process_are_serialized(self):
         lens = Lens(self.dir.name)
         lens.infer([{"a": 1}])
         lens.save()
-
-        import threading
 
         held = threading.Event()
         release = threading.Event()
@@ -514,6 +831,60 @@ class LockTests(unittest.TestCase):
         lens.infer([{"a": 1}])
         lens.save()
         self.assertTrue((Path(self.dir.name) / LOCK_FILENAME).exists())
+
+
+class ConcurrentReadTests(unittest.TestCase):
+    """Concurrent readers always observe one complete revision or another."""
+
+    def test_concurrent_readers_never_see_a_half_written_revision(self):
+        lens_dir = self.dir = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(lens_dir,
+                                                            ignore_errors=True))
+        lens = Lens(lens_dir)
+        lens.infer([{"a": 1}])
+        lens.save()
+        stop = threading.Event()
+        bad_reads = []
+        seen = set()
+
+        def commit_forever():
+            writer = Lens(lens_dir)
+            writer.load()
+            n = 0
+            while not stop.is_set():
+                n += 1
+                writer.infer([{f"f{n}": n}])
+                try:
+                    writer.save()
+                except SchemaConflict:
+                    continue
+
+        def read_forever():
+            while not stop.is_set():
+                reader = Lens(lens_dir)
+                try:
+                    reader.load()
+                    root = reader.schema()
+                except SchemaConflict as exc:
+                    bad_reads.append(str(exc))
+                    continue
+                count = root["count"]
+                # A complete revision has the field recorded for it.
+                if f"f{count - 1}" not in root["fields"] and count > 1:
+                    bad_reads.append(f"revision for {count} records missing field")
+                seen.add(count)
+
+        threads = [threading.Thread(target=commit_forever)]
+        threads += [threading.Thread(target=read_forever) for _ in range(3)]
+        for thread in threads:
+            thread.start()
+        timer = threading.Timer(2.0, stop.set)
+        timer.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        timer.join()
+        self.assertEqual(bad_reads, [])
+        self.assertGreater(len(seen), 1)
 
 
 class DottedKeyPathTests(unittest.TestCase):
@@ -545,6 +916,17 @@ class DottedKeyPathTests(unittest.TestCase):
         reports = lens.check({"a": 1, "x.y": 2})
         self.assertEqual(reports, ['$["x.y"]: unexpected field'])
 
+    def test_literal_star_key_is_quoted_and_distinct_from_marker(self):
+        lens = Lens(tempfile.mkdtemp())
+        lens.infer([{"*": 1}, {"*": 2}])
+        # The real key quotes; missing/type reports stay uniquely located.
+        self.assertEqual(lens.check({}), ['$["*"]: missing required field'])
+        self.assertEqual(
+            lens.check({"*": "x"}),
+            ['$["*"]: type string not in field types [number]'],
+        )
+        self.assertNotIn(OVERFLOW_MARKER, json.dumps(lens.schema()))
+
 
 class ReadRecordsTests(unittest.TestCase):
     def setUp(self):
@@ -575,7 +957,6 @@ class ReadRecordsTests(unittest.TestCase):
     def test_cli_non_object_line_exits_nonzero_with_line_number(self):
         records = Path(self.dir.name, "records.jsonl")
         records.write_text("[1, 2]\n", encoding="utf-8")
-        out = io.StringIO()
         with redirect_stdout(io.StringIO()):
             code = cli_main(["--path", self.dir.name, "infer", str(records)])
         self.assertEqual(code, 2)
@@ -640,6 +1021,88 @@ class CliTests(unittest.TestCase):
         code, _ = self._run("--path", self.lens_dir, "check", self.records)
         self.assertEqual(code, 2)
 
+    def test_versions_command_lists_revisions_oldest_first(self):
+        self._write([{"a": 1}])
+        self._run("--path", self.lens_dir, "infer", self.records)
+        self._write([{"b": "x"}])
+        self._run("--path", self.lens_dir, "infer", self.records)
+        code, out = self._run("--path", self.lens_dir, "versions")
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out), [1, 2])
+
+    def test_versions_command_empty_on_fresh_lens(self):
+        code, out = self._run("--path", self.lens_dir, "versions")
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out), [])
+
+    def test_show_specific_revision(self):
+        self._write([{"a": 1}])
+        self._run("--path", self.lens_dir, "infer", self.records)
+        self._write([{"b": "x"}])
+        self._run("--path", self.lens_dir, "infer", self.records)
+        code, out = self._run("--path", self.lens_dir,
+                              "--version", "1", "show")
+        self.assertEqual(code, 0)
+        self.assertEqual(set(json.loads(out)["fields"]), {"a"})
+
+    def test_check_specific_revision(self):
+        self._write([{"a": 1}])
+        self._run("--path", self.lens_dir, "infer", self.records)
+        self._write([{"b": "x"}])
+        self._run("--path", self.lens_dir, "infer", self.records)
+        self._write([{"a": 2, "b": "y"}])
+        code, out = self._run(
+            "--path", self.lens_dir, "--version", "1", "check", self.records
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("line 1: $.b: unexpected field", out)
+
+    def test_show_missing_revision_fails(self):
+        code, _ = self._run("--path", self.lens_dir, "--version", "7", "show")
+        self.assertEqual(code, 2)
+
+    def test_rollback_command_appends_equivalent_revision(self):
+        self._write([{"a": 1}])
+        self._run("--path", self.lens_dir, "infer", self.records)
+        self._write([{"b": "x"}])
+        self._run("--path", self.lens_dir, "infer", self.records)
+        code, out = self._run("--path", self.lens_dir, "rollback", "1")
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out), {"rolled_back_to": 1, "revision": 3})
+        code, out = self._run("--path", self.lens_dir, "versions")
+        self.assertEqual(json.loads(out), [1, 2, 3])
+        code, latest = self._run("--path", self.lens_dir, "show")
+        code, target = self._run("--path", self.lens_dir,
+                                 "--version", "1", "show")
+        self.assertEqual(json.loads(latest), json.loads(target))
+
+    def test_rollback_missing_revision_fails(self):
+        self._write([{"a": 1}])
+        self._run("--path", self.lens_dir, "infer", self.records)
+        code, _ = self._run("--path", self.lens_dir, "rollback", "5")
+        self.assertEqual(code, 2)
+        code, out = self._run("--path", self.lens_dir, "versions")
+        self.assertEqual(json.loads(out), [1])
+
+    def test_rollback_requires_a_revision(self):
+        code, _ = self._run("--path", self.lens_dir, "rollback")
+        self.assertEqual(code, 2)
+
+    def test_version_flag_only_valid_on_check_and_show(self):
+        code, _ = self._run("--path", self.lens_dir, "--version", "1", "versions")
+        self.assertEqual(code, 2)
+
+    def test_max_versions_option_prunes(self):
+        for index in range(4):
+            self._write([{f"f{index}": index}])
+            code, _ = self._run(
+                "--path", self.lens_dir, "--max-versions", "2",
+                "infer", self.records,
+            )
+            self.assertEqual(code, 0)
+        code, out = self._run("--path", self.lens_dir, "versions")
+        self.assertEqual(json.loads(out), [3, 4])
+
 
 class ResourceLimitTests(unittest.TestCase):
     def setUp(self):
@@ -674,10 +1137,8 @@ class ResourceLimitTests(unittest.TestCase):
         self.assertEqual(list(root["fields"]), ["a"])
         overflow = root["overflow"]
         self.assertTrue(overflow["approximate"])
-        # b seen twice, c once; types only widen across batches.
         self.assertEqual(overflow["observed"], 3)
         self.assertEqual(sorted(overflow["types"]), ["boolean", "number", "string"])
-        # The exact field is untouched by the approximation.
         self.assertEqual(root["fields"]["a"]["observed"], 2)
         self.assertEqual(sorted(root["fields"]["a"]["types"]), ["number"])
 
@@ -710,7 +1171,6 @@ class ResourceLimitTests(unittest.TestCase):
         )
         root = lens.schema()
         user = root["fields"]["user"]["types"]["object"]
-        # Depth 1 stays exact; the deeper addr subtree is collapsed.
         self.assertNotIn("approximate", user)
         self.assertEqual(user["count"], 2)
         self.assertEqual(user["fields"]["name"]["observed"], 2)
@@ -719,7 +1179,6 @@ class ResourceLimitTests(unittest.TestCase):
         self.assertNotIn("fields", addr)
         self.assertEqual(addr["count"], 1)
         self.assertEqual(lens.stats()["approximate"], ["$.user.addr"])
-        # Checking does not descend into the collapsed subtree.
         self.assertEqual(
             lens.check({"user": {"name": "n", "addr": {"anything": [1, {}]}}}), []
         )
@@ -733,12 +1192,21 @@ class ResourceLimitTests(unittest.TestCase):
         self.assertTrue(element["approximate"])
         self.assertEqual(element["count"], 2)
 
-    def test_stats_lists_overflow_location(self):
+    def test_stats_lists_overflow_location_with_non_colliding_marker(self):
         lens = Lens(self.dir.name, max_fields=1)
         lens.infer([{"a": 1, "b": 2}])
-        self.assertEqual(lens.stats()["approximate"], ['$["*"]'])
+        self.assertEqual(lens.stats()["approximate"], ["$.*"])
 
-    def test_approximation_survives_save_and_load(self):
+    def test_marker_distinct_from_literal_star_key(self):
+        lens = Lens(self.dir.name, max_fields=1)
+        # The exact field "*" keeps its quoted path; overflow still gets
+        # the bare marker path, and the two never compare equal.
+        lens.infer([{"*": 1, "other": 2}, {"*": 3, "again": 4}])
+        self.assertEqual(lens.stats()["approximate"], ["$.*"])
+        reports = lens.check({})
+        self.assertIn('$["*"]: missing required field', reports)
+
+    def test_approximation_survives_commits_and_loads(self):
         lens = Lens(self.dir.name, max_fields=1, max_depth=1)
         lens.infer([{"a": 1, "b": {"c": 2}}])
         lens.save()
@@ -746,7 +1214,6 @@ class ResourceLimitTests(unittest.TestCase):
         reloaded.load()
         self.assertEqual(reloaded.schema(), lens.schema())
         self.assertEqual(reloaded.stats()["approximate"], lens.stats()["approximate"])
-        # Appending after reload keeps the overflow monotone.
         reloaded2 = Lens(self.dir.name, max_fields=1, max_depth=1)
         reloaded2.load()
         reloaded2.infer([{"a": 2, "d": "x"}])
@@ -785,8 +1252,42 @@ class ResourceLimitTests(unittest.TestCase):
         self.assertIn('$["a.b"]: type string not in field types [number]', reports)
         self.assertIn("$.a.b: type string not in field types [number]", reports)
 
+    def test_merged_node_caps_exact_field_entries(self):
+        # Two disjoint batches each stay under the cap on their own, but
+        # their union would double it; the merge folds the excess entries
+        # into the overflow entry.
+        first = Lens(self.dir.name, max_fields=2)
+        first.infer([{"a": 1, "b": 1}, {"a": 2, "b": 2}])
+        first.save()
+        second = Lens(self.dir.name, max_fields=2)
+        second.load()
+        second.infer([{"c": "x", "d": "y"}, {"c": "z", "d": "w"}])
+        second.save()
+        reloaded = Lens(self.dir.name, max_fields=2)
+        reloaded.load()
+        root = reloaded.schema()
+        self.assertLessEqual(len(root["fields"]), 2)
+        self.assertIn("overflow", root)
+        self.assertTrue(root["overflow"]["approximate"])
+        # Every folded record still counts.
+        self.assertEqual(root["count"], 4)
+
+    def test_merged_cap_matches_single_capped_pass(self):
+        batches = [
+            [{"a": 1}, {"b": 2}, {"c": 3}],
+            [{"d": 4}, {"e": 5}, {"f": 6}],
+        ]
+        lens = Lens(self.dir.name, max_fields=3)
+        for batch in batches:
+            lens.infer(batch)
+            lens.save()
+        reloaded = Lens(self.dir.name, max_fields=3)
+        reloaded.load()
+        one_shot = Lens(tempfile.mkdtemp(), max_fields=3)
+        one_shot.infer([r for batch in batches for r in batch])
+        self.assertEqual(reloaded.schema(), one_shot.schema())
+
     def test_record_stream_is_not_retained(self):
-        # Folding a large stream keeps only the bounded statistics tree.
         lens = Lens(self.dir.name, max_fields=3, max_depth=2)
 
         def stream():
@@ -806,7 +1307,7 @@ class ResourceLimitTests(unittest.TestCase):
         self.assertTrue(deeper["types"]["object"]["approximate"])
 
 
-class MigrationTests(unittest.TestCase):
+class LegacyMigrationTests(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.dir.cleanup)
@@ -814,28 +1315,55 @@ class MigrationTests(unittest.TestCase):
         lens.infer([{"a": 1, "b": "x"}, {"a": "s"}])
         self.root = lens.schema()
 
-    def _write_version_one(self):
+    def _write_legacy(self, version=2):
         from schema_lens.core import _checksum
 
         path = Path(self.dir.name, SCHEMA_FILENAME)
-        payload = {"version": 1, "checksum": _checksum(self.root), "root": self.root}
+        payload = {"version": version, "checksum": _checksum(self.root),
+                   "root": self.root}
         path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
         return path
 
-    def test_version_one_file_migrates_on_load(self):
-        from schema_lens.core import _checksum
-
-        path = self._write_version_one()
+    def test_legacy_file_migrates_on_load(self):
+        path = self._write_legacy()
         lens = Lens(self.dir.name)
         lens.load()
         self.assertEqual(lens.schema(), self.root)
-        migrated = json.loads(path.read_text(encoding="utf-8"))
-        self.assertEqual(migrated["version"], SCHEMA_VERSION)
-        self.assertEqual(migrated["checksum"], _checksum(migrated["root"]))
-        self.assertEqual(migrated["root"], self.root)
+        self.assertEqual(lens.versions(), [1])
+        # The legacy file is gone and revision 1 carries the schema.
+        self.assertFalse(path.exists())
+        payload = json.loads(revision_path(self.dir.name, 1).read_text())
+        self.assertEqual(payload["version"], SCHEMA_VERSION)
+        self.assertEqual(payload["revision"], 1)
+        self.assertEqual(payload["root"], self.root)
 
-    def test_version_one_file_migrates_on_save_and_keeps_batches(self):
-        self._write_version_one()
+    def test_version_one_file_migrates_too(self):
+        self._write_legacy(version=1)
+        lens = Lens(self.dir.name)
+        lens.load()
+        self.assertEqual(lens.schema(), self.root)
+        self.assertEqual(lens.versions(), [1])
+
+    def test_pinned_read_migrates_legacy_in_place(self):
+        path = self._write_legacy()
+        lens = Lens(self.dir.name)
+        self.assertEqual(lens.schema(version=1), self.root)
+        self.assertFalse(path.exists())
+        self.assertEqual(lens.versions(), [1])
+        # A pin to anything other than revision 1 still conflicts.
+        with self.assertRaises(SchemaConflict):
+            lens.schema(version=2)
+
+    def test_rollback_migrates_legacy_then_appends(self):
+        self._write_legacy()
+        lens = Lens(self.dir.name)
+        new_revision = lens.rollback(1)
+        self.assertEqual(new_revision, 2)
+        self.assertEqual(lens.versions(), [1, 2])
+        self.assertEqual(lens.schema(version=2), self.root)
+
+    def test_legacy_file_migrates_on_save_and_keeps_batches(self):
+        self._write_legacy()
         lens = Lens(self.dir.name)
         lens.load()
         lens.infer([{"c": True}])
@@ -844,59 +1372,62 @@ class MigrationTests(unittest.TestCase):
         reloaded.load()
         self.assertEqual(reloaded.stats()["records"], 3)
         self.assertEqual(sorted(reloaded.schema()["fields"]), ["a", "b", "c"])
-        payload = json.loads(Path(self.dir.name, SCHEMA_FILENAME).read_text())
-        self.assertEqual(payload["version"], SCHEMA_VERSION)
+        self.assertEqual(reloaded.versions(), [1, 2])
+        self.assertFalse(Path(self.dir.name, SCHEMA_FILENAME).exists())
 
     def test_failed_migration_preserves_file_and_memory(self):
         from unittest import mock
 
-        path = self._write_version_one()
+        path = self._write_legacy()
         before = path.read_bytes()
         lens = Lens(self.dir.name)
         with mock.patch(
-            "schema_lens.core._write_payload", side_effect=OSError("disk full")
+            "schema_lens.core._write_atomic", side_effect=OSError("disk full")
         ):
             with self.assertRaises(SchemaConflict):
                 lens.load()
-        # The original file is untouched and memory holds no schema.
+        # The original file is untouched, no revision landed, and memory
+        # holds no schema.
         self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(
+            list(Path(self.dir.name, VERSIONS_DIRNAME).glob("*.json")), []
+        )
         with self.assertRaises(SchemaConflict):
             lens.schema()
         # The read can be retried later and migrates cleanly.
         lens.load()
         self.assertEqual(lens.schema(), self.root)
-        self.assertEqual(
-            json.loads(path.read_text(encoding="utf-8"))["version"], SCHEMA_VERSION
-        )
+        self.assertEqual(lens.versions(), [1])
 
-    def test_failed_migration_during_save_preserves_memory(self):
-        from unittest import mock
-
-        self._write_version_one()
+    def test_corrupt_legacy_file_raises_and_preserves_memory(self):
+        path = self._write_legacy()
+        path.write_text("{not json", encoding="utf-8")
         lens = Lens(self.dir.name)
-        lens.infer([{"c": 1}])
+        lens.infer([{"z": 1}])
         memory = lens.schema()
-        with mock.patch(
-            "schema_lens.core._write_payload", side_effect=OSError("read-only")
-        ):
-            with self.assertRaises(SchemaConflict):
-                lens.save()
+        with self.assertRaises(SchemaConflict):
+            lens.load()
         self.assertEqual(lens.schema(), memory)
-        # The version 1 file is still there, so the retry migrates and
-        # commits the held delta on top of it.
-        lens.save()
-        reloaded = Lens(self.dir.name)
-        reloaded.load()
-        self.assertEqual(reloaded.stats()["records"], 3)
-        self.assertEqual(sorted(reloaded.schema()["fields"]), ["a", "b", "c"])
 
     def test_migrated_schema_equivalent_to_fresh_fold(self):
-        self._write_version_one()
+        self._write_legacy()
         migrated = Lens(self.dir.name)
         migrated.load()
         fresh = Lens(tempfile.mkdtemp())
         fresh.infer([{"a": 1, "b": "x"}, {"a": "s"}])
         self.assertEqual(migrated.schema(), fresh.schema())
+
+    def test_legacy_file_is_ignored_once_revisions_exist(self):
+        # A leftover legacy file never masks committed revisions.
+        lens = Lens(self.dir.name)
+        lens.infer([{"a": 1}])
+        lens.save()
+        Path(self.dir.name, SCHEMA_FILENAME).write_text(
+            json.dumps({"version": 2, "root": {}}), encoding="utf-8"
+        )
+        reloaded = Lens(self.dir.name)
+        reloaded.load()
+        self.assertEqual(set(reloaded.schema()["fields"]), {"a"})
 
 
 class StreamingCliTests(unittest.TestCase):
@@ -925,7 +1456,7 @@ class StreamingCliTests(unittest.TestCase):
         self.assertEqual(code, 0)
         stats = json.loads(out)
         self.assertEqual(stats["records"], 2)
-        self.assertEqual(stats["approximate"], ['$["*"]'])
+        self.assertEqual(stats["approximate"], ["$.*"])
         code, out = self._run("--path", self.lens_dir, "show")
         self.assertEqual(code, 0)
         schema = json.loads(out)

@@ -17,19 +17,41 @@ that has been approximated is flagged with ``"approximate": true`` in the
 schema tree and listed under the ``"approximate"`` key of ``Lens.stats``,
 so precision loss is always visible and never silent. With no limits (the
 default) no approximation is ever triggered and the folded schema is
-exactly the schema produced by folding every record in one pass.
+exactly the schema produced by folding every record in one pass. The field
+cap is also enforced after two batches are merged, so a merged object node
+can never hold more exact field entries than the cap even when the two
+batches named disjoint sets; the excess entries fold into that node's
+overflow entry.
 
-Persistence is incremental and crash safe. ``Lens.save`` serializes commits
-through a lock file inside the lens directory, folds the records folded
-since the last load or save into whatever schema is already stored, and
-writes the result as one atomic file replacement carrying a version and a
-checksum of the whole schema. ``Lens.load`` validates version, structure and
-checksum completely before replacing memory, so a crashed or interrupted
-write can only ever leave the previous complete schema or the next complete
-one, and concurrent committers never lose each other's batches. Files
-written by an older version are migrated to the current version
-atomically on read; a failed migration leaves the original file and the
-in-memory schema untouched and raises ``SchemaConflict`` so it can be
+Persistence is multi-revision, incremental and crash safe. Each ``save``
+is a commit serialized through a lock file inside the lens directory: it
+folds the records folded since the last load or save into the schema of
+the newest committed revision and writes the result as one brand new,
+complete revision file in the ``versions`` directory, each revision
+carrying its own monotonic number and checksum. Revision files are never
+rewritten; a new revision only appears by an atomic rename of a fully
+synced file and its number is one greater than the previous newest, so
+readers see a total order and old revisions are pruned once more than
+``max_versions`` complete revisions exist. A crash or an interrupted
+commit can therefore only ever leave complete revisions, and any reader
+observes either the previous complete revision or the next one, never a
+half-written schema. A revision is
+parsed, structurally validated and checksummed completely before any of
+its content is handed out; a missing or corrupt requested revision raises
+``SchemaConflict`` and leaves every other revision usable.
+
+``check`` and ``schema`` can either target an explicit revision number or
+read the snapshot the lens was opened (``load``-ed) at; inference keeps
+appending batches as before. ``versions`` lists the committed revisions
+oldest first and ``rollback`` expresses the target revision's schema as a
+brand new commit, so history is appended to and never rewritten. A
+revision that has already been pruned (or never existed) makes a rollback
+raise ``SchemaConflict`` without touching any committed revision.
+
+A lens directory holding only the old single-file format (``schema.json``)
+is still read; the legacy file is migrated in place into the revisions
+layout on first read, and a failed migration leaves the original file and
+the in-memory schema untouched and raises ``SchemaConflict`` so it can be
 retried later.
 """
 
@@ -50,15 +72,25 @@ except ImportError:  # pragma: no cover - Windows
     fcntl = None  # type: ignore[assignment]
 try:
     import msvcrt
-except ImportError:  # pragma: no cover - POSIX
+except ImportError:  # pragma: no cover - Windows
     msvcrt = None  # type: ignore[assignment]
 
 SCHEMA_FILENAME = "schema.json"
 LOCK_FILENAME = "schema.lock"
-SCHEMA_VERSION = 2
-# Version 1 files predate approximation markers; their schemas are valid
-# version 2 schemas as-is, so migration only re-encodes the payload.
-READABLE_VERSIONS = (1, SCHEMA_VERSION)
+VERSIONS_DIRNAME = "versions"
+REVISION_PREFIX = "revision-"
+REVISION_SUFFIX = ".json"
+DEFAULT_MAX_VERSIONS = 10
+SCHEMA_VERSION = 3
+# Version 1 files predate approximation markers; version 2 is the single
+# file layout. All three encodings carry the same node tree, so legacy
+# files migrate to the revisions layout without re-interpreting the tree.
+READABLE_VERSIONS = (1, 2, SCHEMA_VERSION)
+# The overflow entry marks approximated locations in stats paths. It is a
+# key no JSON object can literally carry, so it can never collide with a
+# real field name (a field literally named "*" stays locatable as
+# ``$["*"]`` while the marker renders as ``$.*``).
+OVERFLOW_MARKER = "*\x00*"
 
 _KINDS = ("null", "boolean", "number", "string", "array", "object")
 
@@ -196,6 +228,54 @@ def _refresh_node(node: dict) -> None:
     elif node["kind"] == "array":
         for child in node["elements"].values():
             _refresh_node(child)
+
+
+def _cap_object_fields(node: dict, max_fields: int | None) -> None:
+    """Fold exact fields beyond the cap into the overflow entry.
+
+    Applied recursively after two batches merge: folding each batch under
+    the cap bounds the names it introduces, but disjoint names across
+    batches could otherwise leave a merged node with up to twice the cap
+    exact entries. Entries are folded in name order, so which names stay
+    exact is deterministic; folded entries widen the existing overflow
+    entry (which may itself carry records seen under names neither batch
+    tracked exactly) and the result is marked approximate.
+    """
+    if _is_collapsed(node):
+        return
+    if max_fields is not None and len(node["fields"]) > max_fields:
+        # Keep the first names tracked exactly and fold the rest; merged
+        # field order follows global first-seen order (left batch then
+        # names new in the right batch), so this lands on exactly the
+        # entries a single capped pass over every record would have kept.
+        names = list(node["fields"])
+        excess = names[max_fields:]
+        fields = node["fields"]
+        overflow = node.get("overflow")
+        for name in excess:
+            entry = fields.pop(name)
+            overflow = (
+                _merge_field(overflow, entry)
+                if overflow is not None
+                else copy.deepcopy(entry)
+            )
+            overflow["approximate"] = True
+            node["overflow"] = overflow
+    for entry in node["fields"].values():
+        for child in entry["types"].values():
+            _cap_node_fields(child, max_fields)
+    overflow = node.get("overflow")
+    if overflow is not None:
+        for child in overflow["types"].values():
+            _cap_node_fields(child, max_fields)
+
+
+def _cap_node_fields(node: dict, max_fields: int | None) -> None:
+    if node["kind"] == "object":
+        _cap_object_fields(node, max_fields)
+    elif node["kind"] == "array":
+        for child in node["elements"].values():
+            _cap_node_fields(child, max_fields)
 
 
 def _merge_node(left: dict, right: dict) -> dict:
@@ -353,6 +433,16 @@ def _join(path: str, name: str) -> str:
     return f"{path}[{json.dumps(name)}]"
 
 
+def _marker_path(path: str) -> str:
+    """Render the overflow-marker location beneath an object node.
+
+    The marker can never be a real key (see ``OVERFLOW_MARKER``), so a bare
+    ``.*`` segment cannot be produced by ``_join`` for any real field name;
+    a field literally named "*" quotes as ``$["*"]`` and stays distinct.
+    """
+    return f"{path}.*"
+
+
 def _check_object(node: dict, record: dict, path: str, reports: list[str]) -> None:
     if _is_collapsed(node):
         # A depth-capped node tracked no fields, so nothing inside the
@@ -394,23 +484,23 @@ def _check_value(types: dict, value: Any, path: str, reports: list[str]) -> None
 
 def _validate_node(node: Any) -> None:
     if not isinstance(node, dict) or node.get("kind") not in _KINDS:
-        raise SchemaConflict("corrupt schema file: malformed node")
+        raise SchemaConflict("corrupt schema revision: malformed node")
     approximate = node.get("approximate", False)
     if not isinstance(approximate, bool):
-        raise SchemaConflict("corrupt schema file: malformed node")
+        raise SchemaConflict("corrupt schema revision: malformed node")
     kind = node["kind"]
     if kind == "object":
         fields = node.get("fields")
         count = node.get("count")
         if isinstance(count, bool) or not isinstance(count, int):
-            raise SchemaConflict("corrupt schema file: malformed object node")
+            raise SchemaConflict("corrupt schema revision: malformed object node")
         if fields is None:
             # Only a collapsed (approximate) object node may omit fields.
             if not approximate:
-                raise SchemaConflict("corrupt schema file: malformed object node")
+                raise SchemaConflict("corrupt schema revision: malformed object node")
             fields = {}
         if not isinstance(fields, dict):
-            raise SchemaConflict("corrupt schema file: malformed object node")
+            raise SchemaConflict("corrupt schema revision: malformed object node")
         for entry in fields.values():
             _validate_field(entry)
         overflow = node.get("overflow")
@@ -419,14 +509,14 @@ def _validate_node(node: Any) -> None:
     elif kind == "array":
         elements = node.get("elements")
         if not isinstance(elements, dict):
-            raise SchemaConflict("corrupt schema file: malformed array node")
+            raise SchemaConflict("corrupt schema revision: malformed array node")
         for child in elements.values():
             _validate_node(child)
 
 
 def _validate_field(entry: Any) -> None:
     if not isinstance(entry, dict):
-        raise SchemaConflict("corrupt schema file: malformed field entry")
+        raise SchemaConflict("corrupt schema revision: malformed field entry")
     types = entry.get("types")
     observed = entry.get("observed")
     total = entry.get("total")
@@ -441,7 +531,7 @@ def _validate_field(entry: Any) -> None:
         or not isinstance(optional, bool)
         or not isinstance(approximate, bool)
     ):
-        raise SchemaConflict("corrupt schema file: malformed field entry")
+        raise SchemaConflict("corrupt schema revision: malformed field entry")
     for child in types.values():
         _validate_node(child)
 
@@ -454,21 +544,21 @@ def _checksum(root: dict) -> str:
 
 def _validate_payload(payload: Any) -> tuple[int, dict]:
     if not isinstance(payload, dict):
-        raise SchemaConflict("corrupt schema file: not a JSON object")
+        raise SchemaConflict("corrupt schema revision: not a JSON object")
     version = payload.get("version")
     if version not in READABLE_VERSIONS:
         raise SchemaConflict(f"unsupported schema version: {version!r}")
     checksum = payload.get("checksum")
     if not isinstance(checksum, str):
-        raise SchemaConflict("corrupt schema file: missing checksum")
+        raise SchemaConflict("corrupt schema revision: missing checksum")
     if "root" not in payload:
-        raise SchemaConflict("corrupt schema file: missing root")
+        raise SchemaConflict("corrupt schema revision: missing root")
     root = payload["root"]
     _validate_node(root)
     if not isinstance(root, dict) or root.get("kind") != "object":
-        raise SchemaConflict("corrupt schema file: root must be an object")
+        raise SchemaConflict("corrupt schema revision: root must be an object")
     if _checksum(root) != checksum:
-        raise SchemaConflict("corrupt schema file: checksum mismatch")
+        raise SchemaConflict("corrupt schema revision: checksum mismatch")
     return version, root
 
 
@@ -485,10 +575,8 @@ def _fsync_dir(directory: Path) -> None:
         os.close(fd)
 
 
-def _write_payload(file_path: Path, root: dict) -> None:
-    """Write the payload atomically: a crash leaves only the old or new file."""
-    payload = {"version": SCHEMA_VERSION, "checksum": _checksum(root), "root": root}
-    text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+def _write_atomic(file_path: Path, text: str) -> None:
+    """Write text atomically: a crash leaves only the old or new file."""
     tmp = file_path.with_name(file_path.name + ".tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
     try:
@@ -504,6 +592,58 @@ def _write_payload(file_path: Path, root: dict) -> None:
             pass
         raise
     _fsync_dir(file_path.parent)
+
+
+def _revision_path(directory: Path, revision: int) -> Path:
+    return directory / f"{REVISION_PREFIX}{revision:010d}{REVISION_SUFFIX}"
+
+
+def _revision_number(name: str) -> int | None:
+    if not (
+        name.startswith(REVISION_PREFIX)
+        and name.endswith(REVISION_SUFFIX)
+        and len(name)
+        == len(REVISION_PREFIX) + 10 + len(REVISION_SUFFIX)
+    ):
+        return None
+    digits = name[len(REVISION_PREFIX) : -len(REVISION_SUFFIX)]
+    if not digits.isdigit():
+        return None
+    return int(digits)
+
+
+def _encode_revision(revision: int, root: dict) -> str:
+    payload = {
+        "version": SCHEMA_VERSION,
+        "revision": revision,
+        "checksum": _checksum(root),
+        "root": root,
+    }
+    return json.dumps(payload, indent=2, sort_keys=True) + "\n"
+
+
+def _decode_revision(file_path: Path) -> tuple[int, dict]:
+    """Read one revision file and validate it completely before use."""
+    try:
+        raw = file_path.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise SchemaConflict(f"schema revision not found: {file_path.name}") from exc
+    except OSError as exc:
+        raise SchemaConflict(f"cannot read schema revision {file_path}: {exc}") from exc
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise SchemaConflict(f"corrupt schema revision {file_path.name}: {exc}") from exc
+    _version, root = _validate_payload(payload)
+    revision = payload.get("revision")
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
+        raise SchemaConflict("corrupt schema revision: malformed revision number")
+    number_from_name = _revision_number(file_path.name)
+    if number_from_name is not None and number_from_name != revision:
+        raise SchemaConflict(
+            f"corrupt schema revision {file_path.name}: revision number mismatch"
+        )
+    return revision, root
 
 
 class _DirectoryLock:
@@ -570,7 +710,7 @@ class _DirectoryLock:
 
 
 class Lens:
-    """Opens the lens directory ``path`` and manages its stored schema.
+    """Opens the lens directory ``path`` and manages its stored revisions.
 
     ``max_fields`` caps how many field entries each object node tracks
     exactly; further distinct names fold into a shared overflow entry
@@ -581,6 +721,12 @@ class Lens:
     statistic exact and the folded schema identical to folding all records
     in one pass. Records themselves are never retained, so peak memory
     tracks these limits rather than the number of records folded.
+
+    ``max_versions`` bounds how many complete revisions the lens directory
+    keeps; commits beyond the bound prune the oldest revisions, newest
+    first never being touched. It defaults to 10 and must be a positive
+    integer. A revision pruned by retention is no longer readable or a
+    valid rollback target.
     """
 
     def __init__(
@@ -589,22 +735,35 @@ class Lens:
         *,
         max_fields: int | None = None,
         max_depth: int | None = None,
+        max_versions: int = DEFAULT_MAX_VERSIONS,
     ) -> None:
         for label, value in (("max_fields", max_fields), ("max_depth", max_depth)):
             if value is not None and (
                 isinstance(value, bool) or not isinstance(value, int) or value < 0
             ):
                 raise ValueError(f"{label} must be a non-negative integer or None")
+        if (
+            isinstance(max_versions, bool)
+            or not isinstance(max_versions, int)
+            or max_versions < 1
+        ):
+            raise ValueError("max_versions must be a positive integer")
         self.path = Path(path)
         self.max_fields = max_fields
         self.max_depth = max_depth
+        self.max_versions = max_versions
         self._schema: dict | None = None
         self._base: dict | None = None
+        self._revision: int | None = None
         self._lock = _DirectoryLock(self.path)
 
     @property
-    def _file(self) -> Path:
+    def _legacy_file(self) -> Path:
         return self.path / SCHEMA_FILENAME
+
+    @property
+    def _versions_dir(self) -> Path:
+        return self.path / VERSIONS_DIRNAME
 
     def _require(self) -> dict:
         if self._schema is None:
@@ -627,26 +786,47 @@ class Lens:
         _refresh_node(self._schema)
         return self.schema()
 
-    def check(self, record: Any) -> list[str]:
-        """Report every way one record departs from the stored schema."""
-        schema = self._require()
+    def check(self, record: Any, *, version: int | None = None) -> list[str]:
+        """Report every way one record departs from a schema.
+
+        With ``version`` omitted the record is checked against the snapshot
+        this lens was opened at (the schema loaded by the last ``load`` or
+        adopted by the last ``save``); with ``version`` given it is checked
+        against that committed revision, read and fully validated from
+        disk first, without changing the open snapshot or memory. A
+        missing or corrupt revision raises ``SchemaConflict``.
+        """
+        schema = self._select(version)
         if not isinstance(record, dict):
             return [f"$: type {_kind_of(record)} not in field types [object]"]
         reports: list[str] = []
         _check_object(schema, record, "$", reports)
         return reports
 
-    def schema(self) -> dict:
-        """Return the stored schema."""
-        return copy.deepcopy(self._require())
+    def schema(self, *, version: int | None = None) -> dict:
+        """Return the stored schema.
+
+        With ``version`` omitted this is the open snapshot; with a number
+        given it is that committed revision, read and fully validated from
+        disk without changing memory. A missing or corrupt revision raises
+        ``SchemaConflict``.
+        """
+        return copy.deepcopy(self._select(version))
+
+    def _select(self, version: int | None) -> dict:
+        if version is None:
+            return self._require()
+        return self._read_revision(version)
 
     def stats(self) -> dict:
         """Report fields, optional fields, observed types and counts.
 
         The ``"approximate"`` key lists the paths of every statistic that
         has been approximated under the resource limits: collapsed
-        subtrees by their own path and overflow entries as ``$["*"]`` under
-        their object node's path. It is empty when nothing was approximated.
+        subtrees by their own path and overflow entries as ``$.*`` under
+        their object node's path. The marker can never be a real key, so
+        it never collides with a field literally named ``*`` (that field
+        quotes as ``$["*"]``). It is empty when nothing was approximated.
         """
         schema = self._require()
         approximate: set[str] = set()
@@ -678,7 +858,7 @@ class Lens:
                 walk_entry(entry, _join(path, name))
             overflow = node.get("overflow")
             if overflow is not None:
-                walk_entry(overflow, _join(path, "*"))
+                walk_entry(overflow, _marker_path(path))
 
         def walk_node(node: dict, path: str) -> None:
             if node["kind"] == "object":
@@ -693,70 +873,203 @@ class Lens:
         summary["approximate"] = sorted(approximate)
         return summary
 
-    def _read_disk(self) -> dict | None:
-        """Read, validate and migrate the stored schema.
+    # -- revision storage -------------------------------------------------
 
-        Returns ``None`` only when the lens directory holds no schema yet.
-        A file written under an older supported version is migrated to the
-        current version by one atomic replacement before the schema is
-        handed out; if the migration write fails the original file is left
-        exactly as it was and SchemaConflict is raised, so the caller's
-        in-memory schema is never replaced by a half-migrated state and
-        the read can simply be retried later.
+    def _scan_revisions(self) -> list[int]:
+        """Numbers of complete-looking revision files, oldest first.
+
+        Listing alone makes no promise about content; every revision is
+        validated from start to finish before anything uses it.
         """
         try:
-            raw = self._file.read_text(encoding="utf-8")
+            names = os.listdir(self._versions_dir)
+        except FileNotFoundError:
+            return []
+        except OSError as exc:
+            raise SchemaConflict(
+                f"cannot read versions directory {self._versions_dir}: {exc}"
+            ) from exc
+        numbers = [number for name in names if (number := _revision_number(name))]
+        return sorted(set(numbers))
+
+    def _read_revision(self, revision: int) -> dict:
+        if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
+            raise SchemaConflict(f"unknown schema revision: {revision!r}")
+        target = _revision_path(self._versions_dir, revision)
+        if not target.exists() and not self._scan_revisions():
+            # No revision store yet: an old single-file layout may carry
+            # the schema; migrate it in place, then honor the request.
+            self._migrate_legacy()
+        return _decode_revision(target)[1]
+
+    def _read_newest(self) -> tuple[int, dict] | None:
+        numbers = self._scan_revisions()
+        if not numbers:
+            return None
+        # A revision file only appears by an atomic rename of a fully
+        # synced file, so the newest numbered file is complete or absent;
+        # if its content does not validate the stored state is corrupt and
+        # the caller gets SchemaConflict instead of an older schema.
+        revision = numbers[-1]
+        return _decode_revision(_revision_path(self._versions_dir, revision))
+
+    def _migrate_legacy(self) -> tuple[int, dict] | None:
+        """Migrate the old single-file layout into one revision.
+
+        The legacy file is read and fully validated first, then revision 1
+        is written and the directory synced, and only then is the legacy
+        file removed. Any failure before that removal leaves the original
+        file byte for byte untouched, so the migration can simply be
+        retried later.
+        """
+        try:
+            raw = self._legacy_file.read_text(encoding="utf-8")
         except FileNotFoundError:
             return None
         except OSError as exc:
-            raise SchemaConflict(f"cannot read schema file {self._file}: {exc}") from exc
+            raise SchemaConflict(
+                f"cannot read schema file {self._legacy_file}: {exc}"
+            ) from exc
         try:
             payload = json.loads(raw)
         except json.JSONDecodeError as exc:
-            raise SchemaConflict(f"corrupt schema file {self._file}: {exc}") from exc
-        version, root = _validate_payload(payload)
-        if version != SCHEMA_VERSION:
-            try:
-                _write_payload(self._file, root)
-            except OSError as exc:
-                raise SchemaConflict(
-                    f"cannot migrate schema file {self._file} to version "
-                    f"{SCHEMA_VERSION}: {exc}"
-                ) from exc
-        return root
+            raise SchemaConflict(
+                f"corrupt schema file {self._legacy_file}: {exc}"
+            ) from exc
+        _version, root = _validate_payload(payload)
+        try:
+            self._versions_dir.mkdir(parents=True, exist_ok=True)
+            revision_file = _revision_path(self._versions_dir, 1)
+            _write_atomic(revision_file, _encode_revision(1, root))
+        except OSError as exc:
+            raise SchemaConflict(
+                f"cannot migrate schema file {self._legacy_file} into "
+                f"{self._versions_dir}: {exc}"
+            ) from exc
+        try:
+            os.unlink(self._legacy_file)
+        except OSError:
+            # The revision is committed and complete; a leftover legacy
+            # file must not shadow it on the next open.
+            pass
+        _fsync_dir(self.path)
+        return 1, root
+
+    def _read_head(self) -> tuple[int, dict] | None:
+        """The newest complete revision, migrating a legacy layout once."""
+        newest = self._read_newest()
+        if newest is not None:
+            return newest
+        legacy = self._migrate_legacy()
+        if legacy is not None:
+            return legacy
+        return None
+
+    def versions(self) -> list[int]:
+        """Committed revision numbers, oldest first; empty before any commit."""
+        return self._scan_revisions()
 
     def save(self) -> None:
         """Commit the stored schema into the lens directory.
 
         The commit is serialized by a non-blocking lock file in the
-        directory; contention raises SchemaConflict. Under the lock the
-        stored schema is re-read and fully validated, the records folded
-        since the last load or save are merged in, and the result is written
-        as one atomic file replacement carrying a version and a checksum.
-        Memory is replaced only after the write lands, so a failed commit
-        leaves the in-memory schema untouched and earlier commits are never
-        overwritten.
+        directory; contention raises SchemaConflict and the in-memory
+        batch stays retryable. Under the lock the newest complete
+        revision is read and fully validated, the records folded since the
+        last load or save are merged in, the field cap is re-imposed on
+        the merged tree, and the result is written as a brand new complete
+        revision file. The newest-revision pointer only advances after the
+        file is fully on disk, revisions older than ``max_versions`` are
+        pruned, and memory is replaced only after the commit lands, so a
+        failed commit leaves memory and every committed revision untouched.
         """
         self._require()
         self.path.mkdir(parents=True, exist_ok=True)
         with self._lock.held():
-            disk = self._read_disk()
-            if disk is None:
+            head = self._read_head()
+            if head is None:
+                revision = 1
                 merged = copy.deepcopy(self._schema)
             else:
+                head_revision, disk = head
+                revision = head_revision + 1
                 delta = _subtract_node(self._schema, self._base)
                 merged = _merge_node(disk, delta)
             _refresh_node(merged)
-            _write_payload(self._file, merged)
+            _cap_node_fields(merged, self.max_fields)
+            _refresh_node(merged)
+            self._versions_dir.mkdir(parents=True, exist_ok=True)
+            target = _revision_path(self._versions_dir, revision)
+            _write_atomic(target, _encode_revision(revision, merged))
+            self._prune(revision)
         self._schema = merged
         self._base = copy.deepcopy(merged)
+        self._revision = revision
 
-    def load(self) -> None:
-        """Re-read the stored schema, replacing memory only on success."""
-        root = self._read_disk()
-        if root is None:
-            raise SchemaConflict(
-                f"cannot read schema file {self._file}: no such file"
-            )
+    def _prune(self, newest: int) -> None:
+        """Remove complete revisions beyond the retention bound.
+
+        Only numbered revision files older than ``newest - max_versions +
+        1`` are removed; the newest ``max_versions`` revisions and any
+        other file in the directory are left alone.
+        """
+        cutoff = newest - self.max_versions
+        if cutoff < 1:
+            return
+        for revision in self._scan_revisions():
+            if revision <= cutoff:
+                try:
+                    os.unlink(_revision_path(self._versions_dir, revision))
+                except FileNotFoundError:
+                    pass
+        _fsync_dir(self._versions_dir)
+
+    def load(self, *, version: int | None = None) -> None:
+        """Read committed schema, replacing memory only on success.
+
+        With ``version`` omitted the newest complete revision is read (and
+        a legacy single-file layout migrated in place); with a number
+        given that exact revision is read and fully validated. A missing
+        revision or a corrupt file raises ``SchemaConflict`` and leaves
+        memory exactly as it was.
+        """
+        if version is None:
+            head = self._read_head()
+            if head is None:
+                raise SchemaConflict(
+                    f"no schema revisions in {self._versions_dir}"
+                )
+            revision, root = head
+        else:
+            revision = version
+            root = self._read_revision(revision)
         self._schema = root
         self._base = copy.deepcopy(root)
+        self._revision = revision
+
+    def rollback(self, version: int) -> int:
+        """Commit the schema of revision ``version`` as a new revision.
+
+        History is never rewritten: the target revision stays put and a
+        brand new revision carrying an equivalent schema is committed on
+        top of it, so the revision list keeps growing. Rolling back to a
+        revision that does not exist or fails validation raises
+        ``SchemaConflict`` and changes no committed revision. Returns the
+        new revision number; the in-memory snapshot adopts it.
+        """
+        if isinstance(version, bool) or not isinstance(version, int) or version < 1:
+            raise SchemaConflict(f"unknown schema revision: {version!r}")
+        self.path.mkdir(parents=True, exist_ok=True)
+        with self._lock.held():
+            target_root = self._read_revision(version)
+            head = self._read_newest()
+            new_revision = 1 if head is None else head[0] + 1
+            merged = copy.deepcopy(target_root)
+            self._versions_dir.mkdir(parents=True, exist_ok=True)
+            target = _revision_path(self._versions_dir, new_revision)
+            _write_atomic(target, _encode_revision(new_revision, merged))
+            self._prune(new_revision)
+        self._schema = merged
+        self._base = copy.deepcopy(merged)
+        self._revision = new_revision
+        return new_revision

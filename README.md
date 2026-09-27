@@ -15,16 +15,87 @@ Python 3.11 or newer. Standard library only.
     python3 -m schema_lens --path ./lens infer <records.jsonl>
     python3 -m schema_lens --path ./lens check <records.jsonl>
     python3 -m schema_lens --path ./lens show
+    python3 -m schema_lens --path ./lens versions
+    python3 -m schema_lens --path ./lens rollback <revision>
+
+`check` and `show` accept `--version <revision>` to target one specific
+committed revision; without it they use the snapshot loaded at open time.
 
 ## Public interface
 
 `schema_lens.Lens(path)` opens the lens directory `path`.
 - `infer(records) -> dict` folds a sequence of records into the stored schema.
-- `check(record) -> list[str]` reports every way one record departs from the stored schema.
-- `schema() -> dict` returns the stored schema.
-- `save() -> None` and `load() -> None` persist it and re-read it before replacing memory.
+- `check(record, *, version=None) -> list[str]` reports every way one record departs from the stored schema, or from one committed revision.
+- `schema(*, version=None) -> dict` returns the stored schema, or one committed revision.
+- `save() -> None` and `load(*, version=None) -> None` commit and read before replacing memory.
+- `versions() -> list[int]` lists committed revision numbers, oldest first.
+- `rollback(version) -> int` commits the target revision's schema again as a new revision and returns the new revision number.
 - `stats() -> dict` reports fields, optional fields, observed types and observation counts.
 - `SchemaConflict` exported exception.
+
+`Lens(path, max_versions=...)` (and the matching `--max-versions` command
+line option, default 10) bounds how many complete revisions the lens
+directory keeps; every commit beyond the bound prunes the oldest
+revisions. A pruned revision is no longer readable or a valid rollback
+target.
+
+## Revisions, snapshots and rollback
+
+Every `save` is one commit: the records folded since the last `load` or
+`save` are merged into the newest committed revision and the result is
+written as a brand new, complete, immutable revision file under
+`versions/` (`revision-0000000001.json`, `revision-0000000002.json`, ...),
+each carrying its own monotonic `revision` number and a SHA-256
+`checksum` of the whole schema. Revision files are never rewritten and
+revision numbers never repeat. A revision file appears only by an atomic
+rename of a fully synced file, so after a crash or an interrupted commit
+each revision is either completely readable or absent, and concurrent
+readers always observe one complete revision or another, never a
+half-written schema.
+
+Commits are serialized by `schema.lock`, a non-blocking lock file inside
+the lens directory. When another thread or process holds the lock the
+call raises `SchemaConflict` without changing any committed revision; the
+in-memory batch is kept, so retrying the same `save` later lands on top of
+everything committed in the meantime. Every revision is parsed,
+structurally validated and checksummed in full before any of its content
+is used. A missing or corrupt requested revision (an explicit
+`version=`, a `rollback` target, or the newest revision on an unqualified
+read) raises `SchemaConflict`; one damaged revision does not make the
+other revisions unusable.
+
+`load()` reads the newest revision; `load(version=N)` reads exactly
+revision N. Memory is replaced only after the read validates completely.
+Reads while other commits are in flight are snapshots: once a lens is
+opened at a revision, `check`/`schema`/`stats` keep answering for that
+revision no matter how many newer commits land, until the next `load`.
+Inference still appends batches as before; the held delta merges onto the
+newest committed revision at the next `save`. `check(record, version=N)`
+and `schema(version=N)` read one committed revision directly without
+moving the open snapshot.
+
+`versions()` returns the committed revision numbers oldest first and is
+empty on a directory with no history; reading any specific revision in an
+empty history raises `SchemaConflict`. `rollback(N)` expresses the target
+revision as a new commit: revision N is never rewritten or deleted, a new
+revision carrying an equivalent schema is appended on top, and the
+returned revision is what subsequent unqualified reads see. Rolling back
+to a revision that is missing, pruned or corrupt raises `SchemaConflict`
+and changes no committed revision.
+
+A lens directory that only holds the old single-file format
+(`schema.json`, format version 1 or 2) is still read. The legacy file is
+validated completely and migrated in place into revision 1 the first time
+it is read (including the first explicit revision read or rollback); after
+migration the legacy file is removed. A failed migration (say, an
+unwritable directory) leaves the original file byte for byte untouched and
+raises `SchemaConflict`, so the read can simply be retried later.
+
+The merged schema also re-imposes `max_fields` after two batches merge:
+disjoint field names across batches can never leave a merged object node
+holding more exact entries than the cap — excess entries fold into that
+node's overflow entry, and with the cap in force the committed result is
+the same schema a single capped pass over every record would produce.
 
 ## Streaming inference under resource limits
 
@@ -58,11 +129,13 @@ records are folded, so it never silently drops a type it once reported.
 Approximation is always visible, never silent: the flags appear in the
 `schema()` tree and the `show` output, and `stats()` lists the path of
 every approximated statistic under its `"approximate"` key — collapsed
-subtrees by their own path, overflow entries as `$["*"]` under their
-object node's path. When checking records, a field name that fell into an
-overflow entry is validated against the overflow entry's widened type set
-instead of being reported as unexpected, and collapsed subtrees are not
-descended into.
+subtrees by their own path, overflow entries as `$.*` under their object
+node's path. The marker segment `*` is not a quoted key and cannot be a
+real field name, so a field literally named `*` is still reported as
+`$["*"]` and never confused with the overflow marker. When checking
+records, a field name that fell into an overflow entry is validated
+against the overflow entry's widened type set instead of being reported
+as unexpected, and collapsed subtrees are not descended into.
 
 ## Incremental inference
 
@@ -71,36 +144,16 @@ again whenever you like. Only the records folded since the last `load` or
 `save` are merged into the committed schema, so earlier batches stay folded
 in and are never recomputed or lost. The schema read back after any number
 of appended batches is exactly the schema produced by folding every record
-once in one pass.
-
-`save` commits through `schema.lock`, a non-blocking lock file inside the
-lens directory. When another process holds the lock the call raises
-`SchemaConflict` without changing the committed schema; retry the same
-`save` later (in-memory state is kept) and its batch still lands on top of
-everything committed in the meantime.
-
-The schema is stored as `schema.json`, a single JSON object with a
-`version`, a `checksum` (a SHA-256 of the whole schema in canonical form)
-and the `root` schema. The current format version is 2; version 1 files
-are still read, and are migrated in place by one atomic replacement the
-first time they are read, so after migration the file's checksum matches
-its content again. A failed migration (say, an unwritable directory)
-leaves the original file byte for byte untouched, leaves the in-memory
-schema exactly as it was, and raises `SchemaConflict`, so the read can
-simply be retried later. Each commit writes a fresh file and atomically
-replaces the old one, so a crash or interrupted write can only leave the
-previous complete schema or the new complete schema — never a readable file
-that fails its checksum. `load` parses and fully validates the version, the
-structure and the checksum, and only then replaces the in-memory schema; a
-missing or invalid file raises `SchemaConflict` and leaves memory exactly
-as it was.
+once in one pass; when a field cap is in force, the cap is re-imposed on
+the merged tree after each commit so the bound holds across batches too.
 
 Field paths in check reports keep dotted and quoted keys apart: ordinary
 identifier fields read as `$.user.name`, array elements as `$.tags[1]`, and
 any key that is not an identifier is bracketed and JSON-quoted, so a field
 literally named `a.b` is reported as `$["a.b"]` and can never be confused
 with the nested path `$.a.b`. Backslashes are quoted the same way
-(`$["a\\b"]`).
+(`$["a\\b"]`), and a field literally named `*` reads as `$["*"]`, distinct
+from the `$.*` overflow marker.
 
 ## Tests
 
