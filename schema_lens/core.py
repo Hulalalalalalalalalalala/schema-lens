@@ -53,6 +53,28 @@ is still read; the legacy file is migrated in place into the revisions
 layout on first read, and a failed migration leaves the original file and
 the in-memory schema untouched and raises ``SchemaConflict`` so it can be
 retried later.
+
+The oldest stretch of revisions can be compacted into one baseline
+revision (``Lens.compact``, state from ``Lens.compact_status``). Revisions
+are cumulative, so the merged range's final pattern and statistics are
+exactly its boundary revision's: the boundary is fully validated and
+copied verbatim into the baseline product, which keeps the boundary's
+revision number and reads as that complete revision. The product is
+staged under a temp name, fsynced, re-read from disk and structurally
+and checksum validated before a single small pointer file
+(``baseline.json``) atomically switches to it; only after the switch are
+the merged originals deleted, so up to the switch every original stays
+readable and after a crash the round is either wholly present or wholly
+absent, never leaving two baselines or a half product (the next locked
+operation resolves any leftovers). Once switched, requests for merged
+revisions raise ``SchemaConflict`` while the baseline and every later
+revision read normally. Reads never take the lock, so compaction and
+commits never block reads and a read in flight always lands on one
+complete revision; commits schedule background rounds once the live
+history fills to the compaction watermark. Version resolution is a
+constant-time pointer lookup, listing is one directory read, and a round
+reads one revision and writes one file, so none of these scale linearly
+with the retained history or re-read and re-merge the whole history.
 """
 
 from __future__ import annotations
@@ -63,6 +85,7 @@ import hashlib
 import json
 import os
 import threading
+import time
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
@@ -80,7 +103,21 @@ LOCK_FILENAME = "schema.lock"
 VERSIONS_DIRNAME = "versions"
 REVISION_PREFIX = "revision-"
 REVISION_SUFFIX = ".json"
+# A compacted baseline is published under its own final name; the pointer
+# switches when that name appears by an atomic rename, and a pinned read
+# resolves a number to at most two path lookups. The staging temp matches
+# neither final pattern, so it can never be read as a complete revision.
+BASELINE_POINTER_NAME = "baseline.json"
+BASELINE_POINTER_TMP_NAME = BASELINE_POINTER_NAME + ".tmp"
+BASELINE_MARK = ".baseline"
+BASELINE_SUFFIX = BASELINE_MARK + REVISION_SUFFIX
+COMPACT_TMP_SUFFIX = BASELINE_MARK + ".tmp"
 DEFAULT_MAX_VERSIONS = 10
+# Background compaction only kicks in once the live history reaches at
+# least this many revisions (or ``max_versions`` when that is larger), so
+# it never disturbs a deliberately tiny history that retention already
+# bounds; ``compact`` triggers a round on demand.
+COMPACT_WATERMARK = 10
 SCHEMA_VERSION = 3
 # Version 1 files predate approximation markers; version 2 is the single
 # file layout. All three encodings carry the same node tree, so legacy
@@ -612,6 +649,24 @@ def _revision_number(name: str) -> int | None:
     return int(digits)
 
 
+def _baseline_number(name: str) -> int | None:
+    """The revision number of a ``revision-N.baseline.json`` file."""
+    if not (
+        name.startswith(REVISION_PREFIX) and name.endswith(BASELINE_SUFFIX)
+    ):
+        return None
+    digits = name[
+        len(REVISION_PREFIX) : len(name) - len(BASELINE_SUFFIX)
+    ]
+    if len(digits) != 10 or not digits.isdigit():
+        return None
+    return int(digits)
+
+
+def _is_baseline_name(name: str) -> int | None:
+    return _baseline_number(name)
+
+
 def _encode_revision(revision: int, root: dict) -> str:
     payload = {
         "version": SCHEMA_VERSION,
@@ -646,6 +701,50 @@ def _decode_revision(file_path: Path) -> tuple[int, dict]:
     return revision, root
 
 
+def _encode_pointer(baseline: int, replaces: list[int]) -> str:
+    """Encode the compaction pointer with its own checksum.
+
+    The pointer is the single switch of a compaction: it names the
+    baseline revision and every revision number merged into it.
+    """
+    body = {"baseline": baseline, "replaces": replaces}
+    canonical = json.dumps(body, sort_keys=True, separators=(",", ":"))
+    payload = dict(body)
+    payload["checksum"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return json.dumps(payload, indent=2, sort_keys=True) + "\n"
+
+
+def _decode_pointer_payload(payload: Any) -> tuple[int, list[int]]:
+    if not isinstance(payload, dict):
+        raise SchemaConflict("corrupt compaction pointer: not a JSON object")
+    baseline = payload.get("baseline")
+    replaces = payload.get("replaces")
+    checksum = payload.get("checksum")
+    if (
+        isinstance(baseline, bool)
+        or not isinstance(baseline, int)
+        or baseline < 1
+        or not isinstance(replaces, list)
+        or not replaces
+        or baseline not in replaces
+        or any(
+            isinstance(number, bool)
+            or not isinstance(number, int)
+            or number < 1
+            or number > baseline
+            for number in replaces
+        )
+        or replaces != sorted(set(replaces))
+        or not isinstance(checksum, str)
+    ):
+        raise SchemaConflict("corrupt compaction pointer: malformed fields")
+    body = {"baseline": baseline, "replaces": replaces}
+    canonical = json.dumps(body, sort_keys=True, separators=(",", ":"))
+    if hashlib.sha256(canonical.encode("utf-8")).hexdigest() != checksum:
+        raise SchemaConflict("corrupt compaction pointer: checksum mismatch")
+    return baseline, replaces
+
+
 class _DirectoryLock:
     """Non-blocking commit lock shared by threads and processes."""
 
@@ -653,6 +752,11 @@ class _DirectoryLock:
         self._directory = directory
         self._thread_lock = threading.Lock()
         self._fd: int | None = None
+
+    @property
+    def held_here(self) -> bool:
+        """Whether this thread (and this instance) currently holds the lock."""
+        return self._fd is not None
 
     def acquire(self) -> None:
         if not self._thread_lock.acquire(blocking=False):
@@ -727,6 +831,16 @@ class Lens:
     first never being touched. It defaults to 10 and must be a positive
     integer. A revision pruned by retention is no longer readable or a
     valid rollback target.
+
+    The oldest stretch of retained revisions can be compacted into one
+    baseline revision (``compact``, with state from ``compact_status`` and
+    a background run kicked off automatically once commits pile up to
+    ``max_versions``). The merged range's final pattern and statistics are
+    preserved exactly; the baseline is staged as a temp product, fully
+    validated and only then published by atomically switching one small
+    pointer file, and the merged originals are deleted only after the
+    switch. Reads never take the lock, so commits and compaction never
+    block reads and every read lands on one complete revision.
     """
 
     def __init__(
@@ -756,6 +870,8 @@ class Lens:
         self._base: dict | None = None
         self._revision: int | None = None
         self._lock = _DirectoryLock(self.path)
+        self._compacting = threading.Event()
+        self._compact_thread: threading.Thread | None = None
 
     @property
     def _legacy_file(self) -> Path:
@@ -875,43 +991,147 @@ class Lens:
 
     # -- revision storage -------------------------------------------------
 
-    def _scan_revisions(self) -> list[int]:
-        """Numbers of complete-looking revision files, oldest first.
-
-        Listing alone makes no promise about content; every revision is
-        validated from start to finish before anything uses it.
-        """
+    def _physical_names(self) -> list[str]:
         try:
-            names = os.listdir(self._versions_dir)
+            return os.listdir(self._versions_dir)
         except FileNotFoundError:
             return []
         except OSError as exc:
             raise SchemaConflict(
                 f"cannot read versions directory {self._versions_dir}: {exc}"
             ) from exc
-        numbers = [number for name in names if (number := _revision_number(name))]
-        return sorted(set(numbers))
+
+    def _read_pointer(self) -> tuple[int, list[int]] | None:
+        """The published compaction pointer: ``(baseline, replaces)``.
+
+        The pointer is one tiny file read, independent of how many
+        revisions are retained; it exists only after a compaction's
+        baseline has been fully written and validated. A missing pointer
+        means no compaction has published; a present but malformed one is
+        store-level corruption and raises like a corrupt revision would.
+        """
+        path = self._versions_dir / BASELINE_POINTER_NAME
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise SchemaConflict(f"cannot read compaction pointer: {exc}") from exc
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise SchemaConflict(f"corrupt compaction pointer: {exc}") from exc
+        return _decode_pointer_payload(payload)
+
+    def _baseline_path(self, baseline: int) -> Path:
+        return self._versions_dir / (
+            f"{REVISION_PREFIX}{baseline:010d}{BASELINE_SUFFIX}"
+        )
+
+    def _resolve(self, revision: int) -> Path:
+        """Map one visible revision number to its file, in constant time.
+
+        The baseline number maps to its baseline file and every other
+        number to the ordinary revision file; a number the pointer records
+        as replaced is gone even if its file briefly outlives a crash.
+        """
+        pointer = self._read_pointer()
+        if pointer is not None:
+            baseline, replaces = pointer
+            if revision == baseline:
+                return self._baseline_path(baseline)
+            if revision in replaces:
+                raise SchemaConflict(
+                    f"schema revision {revision} was compacted into baseline "
+                    f"revision {baseline}"
+                )
+        return _revision_path(self._versions_dir, revision)
+
+    def _scan_revisions(self) -> list[int]:
+        """Numbers of readable revisions, oldest first.
+
+        A directory listing plus one fixed-size pointer read; no revision
+        file is parsed, so the cost never grows with retained history.
+        Numbers merged into the baseline are excluded even while their
+        files wait for crash-cleanup, since the pointer has switched; the
+        baseline number itself is included. A read that catches the exact
+        switch of one baseline into the next follows the new pointer once
+        rather than failing against the just-removed old baseline.
+        """
+        pointer = self._read_pointer()
+        for _attempt in (1, 2):
+            hidden: set[int] = set()
+            numbers = {
+                number
+                for name in self._physical_names()
+                if (number := _revision_number(name)) is not None
+            }
+            if pointer is None:
+                return sorted(numbers)
+            baseline, replaces = pointer
+            hidden.update(replaces)
+            hidden.discard(baseline)
+            numbers.add(baseline)
+            if self._baseline_path(baseline).exists():
+                return sorted(numbers - hidden)
+            # The baseline named by the pointer vanished: a newer round
+            # switched it away between the pointer read and the lookup.
+            refreshed = self._read_pointer()
+            if refreshed == pointer:
+                raise SchemaConflict(
+                    f"compaction baseline revision {baseline} is missing"
+                )
+            pointer = refreshed
+        raise SchemaConflict("compaction state changed while reading revisions")
+
+    def _decode_at(self, path: Path) -> dict | None:
+        """Decode a revision file, or None if it vanished before the open.
+
+        Content corruption still raises; a file that disappears under a
+        reader (a newer compaction switched that baseline away) is the
+        one signal to re-read the pointer and resolve again.
+        """
+        try:
+            return _decode_revision(path)[1]
+        except SchemaConflict:
+            if path.exists():
+                raise
+            return None
 
     def _read_revision(self, revision: int) -> dict:
         if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
             raise SchemaConflict(f"unknown schema revision: {revision!r}")
-        target = _revision_path(self._versions_dir, revision)
-        if not target.exists() and not self._scan_revisions():
-            # No revision store yet: an old single-file layout may carry
-            # the schema; migrate it in place, then honor the request.
-            self._migrate_legacy()
-        return _decode_revision(target)[1]
+        for _attempt in (1, 2):
+            # ``_resolve`` re-reads the pointer every attempt, so a number
+            # a newer round merged away raises as compacted on retry while
+            # a stable mapping simply decodes its file.
+            target = self._resolve(revision)
+            root = self._decode_at(target)
+            if root is not None:
+                return root
+            if not self._physical_names() and self._read_pointer() is None:
+                # No revision store yet: an old single-file layout may
+                # carry the schema; migrate it in place, then honor it.
+                self._migrate_legacy()
+        raise SchemaConflict(f"unknown schema revision: {revision}")
 
     def _read_newest(self) -> tuple[int, dict] | None:
-        numbers = self._scan_revisions()
-        if not numbers:
-            return None
-        # A revision file only appears by an atomic rename of a fully
-        # synced file, so the newest numbered file is complete or absent;
-        # if its content does not validate the stored state is corrupt and
-        # the caller gets SchemaConflict instead of an older schema.
-        revision = numbers[-1]
-        return _decode_revision(_revision_path(self._versions_dir, revision))
+        for _attempt in (1, 2):
+            numbers = self._scan_revisions()
+            if not numbers:
+                return None
+            # A revision file only appears by an atomic rename of a fully
+            # synced file, so the newest numbered revision is complete or
+            # absent; if its content does not validate the stored state is
+            # corrupt and the caller gets SchemaConflict instead of an
+            # older schema. A file that vanishes is a baseline a newer
+            # round just switched away, so the scan is taken once more.
+            revision = numbers[-1]
+            path = self._resolve(revision)
+            root = self._decode_at(path)
+            if root is not None:
+                return revision, root
+        raise SchemaConflict("schema head changed while reading revisions")
 
     def _migrate_legacy(self) -> tuple[int, dict] | None:
         """Migrate the old single-file layout into one revision.
@@ -985,7 +1205,11 @@ class Lens:
         """
         self._require()
         self.path.mkdir(parents=True, exist_ok=True)
+        self._wait_background()
         with self._lock.held():
+            # Finish any compaction an interrupted process left behind
+            # before committing on top of the store.
+            self._recover_compaction()
             head = self._read_head()
             if head is None:
                 revision = 1
@@ -1005,24 +1229,351 @@ class Lens:
         self._schema = merged
         self._base = copy.deepcopy(merged)
         self._revision = revision
+        # Once enough revisions have accumulated, fold the oldest stretch
+        # in the background; the commit itself has already returned.
+        self._schedule_compaction()
 
     def _prune(self, newest: int) -> None:
         """Remove complete revisions beyond the retention bound.
 
         Only numbered revision files older than ``newest - max_versions +
         1`` are removed; the newest ``max_versions`` revisions and any
-        other file in the directory are left alone.
+        other file in the directory are left alone. A published baseline
+        is the anchor of its compacted range and is never pruned.
         """
         cutoff = newest - self.max_versions
         if cutoff < 1:
             return
+        pointer = self._read_pointer()
+        baseline = pointer[0] if pointer is not None else None
         for revision in self._scan_revisions():
+            if revision == baseline:
+                continue
             if revision <= cutoff:
                 try:
                     os.unlink(_revision_path(self._versions_dir, revision))
                 except FileNotFoundError:
                     pass
         _fsync_dir(self._versions_dir)
+
+    # -- background compaction -------------------------------------------
+
+    def _compact_targets(self) -> tuple[list[int], int] | None:
+        """The oldest stretch to merge, with its boundary revision.
+
+        The boundary is the midpoint of the visible history, so each
+        compaction round folds a fresh prefix onto the baseline and every
+        round stays geometric; with exactly two revisions the older one is
+        merged into a baseline carrying the newer. Fewer than two
+        revisions leave nothing to merge.
+        """
+        numbers = self._scan_revisions()
+        if len(numbers) < 2:
+            return None
+        if len(numbers) == 2:
+            boundary_index = 1
+        else:
+            boundary_index = (len(numbers) - 1) // 2
+        targets = numbers[: boundary_index + 1]
+        return targets, targets[-1]
+
+    def _recover_compaction(self) -> None:
+        """Resolve leftovers of an interrupted compaction under the lock.
+
+        A staging temp is always safe to delete: the pointer never moved
+        while it existed. A baseline file with no pointer (or not named by
+        the pointer) was renamed into place but never switched to, so it is
+        an unpublished half product and is removed. When the pointer did
+        switch, its baseline is kept and every file for a replaced number
+        (ordinary or baseline) is deleted to finish the cleanup. The
+        pointer itself is the one atomic switch, so recovery makes the
+        compaction either wholly present or wholly absent and never leaves
+        two baselines.
+        """
+        try:
+            names = os.listdir(self._versions_dir)
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise SchemaConflict(
+                f"cannot read versions directory {self._versions_dir}: {exc}"
+            ) from exc
+        for name in names:
+            if name.endswith(COMPACT_TMP_SUFFIX) or name == BASELINE_POINTER_TMP_NAME:
+                try:
+                    os.unlink(self._versions_dir / name)
+                except FileNotFoundError:
+                    pass
+        pointer = self._read_pointer()
+        if pointer is None:
+            for name in names:
+                if _is_baseline_name(name):
+                    try:
+                        os.unlink(self._versions_dir / name)
+                    except FileNotFoundError:
+                        pass
+            _fsync_dir(self._versions_dir)
+            return
+        baseline, replaces = pointer
+        if not self._baseline_path(baseline).exists():
+            raise SchemaConflict(
+                f"compaction baseline revision {baseline} is missing"
+            )
+        for number in replaces:
+            # The boundary number survives only as its baseline file;
+            # every other replaced number disappears entirely.
+            try:
+                os.unlink(_revision_path(self._versions_dir, number))
+            except FileNotFoundError:
+                pass
+            if number != baseline:
+                try:
+                    os.unlink(self._baseline_path(number))
+                except FileNotFoundError:
+                    pass
+        # A newer, unpublished baseline file can only be a crashed run's.
+        for name in names:
+            parsed = _is_baseline_name(name)
+            if parsed is not None and parsed != baseline:
+                try:
+                    os.unlink(self._versions_dir / name)
+                except FileNotFoundError:
+                    pass
+        _fsync_dir(self._versions_dir)
+
+    def _compact_locked(self) -> int | None:
+        """Merge the oldest stretch of revisions into one baseline.
+
+        The lock is held by the caller. Revisions are cumulative, so the
+        merged range's final pattern and statistics are exactly the
+        boundary revision's; that revision is fully validated and copied
+        verbatim into the baseline product (no type semantics are
+        re-derived and nothing is coerced). The product is staged under a
+        temp name, fsynced, re-read from disk and structurally and
+        checksum validated before the pointer atomically switches to it;
+        only after the switch are the merged originals removed. The round
+        reads one revision and writes one file, which is strictly less
+        work than re-reading and re-merging the whole history.
+        """
+        self._recover_compaction()
+        picked = self._compact_targets()
+        if picked is None:
+            return None
+        targets, boundary = picked
+        versions_dir = self._versions_dir
+        boundary_root = _decode_revision(self._resolve(boundary))[1]
+        pointer = self._read_pointer()
+        if pointer is None:
+            replaces = list(targets)
+        else:
+            previous_baseline, previous_replaces = pointer
+            # A new round extends the existing baseline; its old files are
+            # absorbed into the replacement set and removed at publish.
+            merged = set(previous_replaces)
+            merged.update(targets)
+            replaces = sorted(merged)
+            if previous_baseline not in targets:
+                # The stretch must start at the current baseline so the
+                # history stays one contiguous, anchored range.
+                raise SchemaConflict(
+                    "compaction aborted: compacted range is not anchored at "
+                    f"baseline revision {previous_baseline}"
+                )
+        stage = versions_dir / (
+            f"{REVISION_PREFIX}{boundary:010d}{COMPACT_TMP_SUFFIX}"
+        )
+        final = self._baseline_path(boundary)
+        pointer_stage = versions_dir / BASELINE_POINTER_TMP_NAME
+        try:
+            fd = os.open(stage, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(_encode_revision(boundary, boundary_root))
+                handle.flush()
+                os.fsync(handle.fileno())
+            # Re-read the staged product from disk and prove it is
+            # self-consistent and identical to the validated boundary
+            # before any pointer can point at it.
+            staged_number, staged_root = _decode_revision(stage)
+            if staged_number != boundary or staged_root != boundary_root:
+                raise SchemaConflict("compaction aborted: staged baseline mismatch")
+            os.replace(stage, final)
+            _fsync_dir(versions_dir)
+            # The single atomic switch: readers resolve through the
+            # pointer only once this rename lands.
+            fd = os.open(pointer_stage, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(_encode_pointer(boundary, replaces))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(pointer_stage, versions_dir / BASELINE_POINTER_NAME)
+            _fsync_dir(versions_dir)
+        except BaseException:
+            for path in (stage, pointer_stage):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+            raise
+        # Switch complete: the merged originals may now disappear,
+        # including the boundary's ordinary revision file -- the boundary
+        # number itself stays readable through the baseline file. Files
+        # already gone (numbers replaced by an earlier round) are skipped.
+        for number in targets:
+            for path in (
+                _revision_path(versions_dir, number),
+                self._baseline_path(number),
+            ):
+                if number == boundary and path == self._baseline_path(number):
+                    continue
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
+        _fsync_dir(versions_dir)
+        return boundary
+
+    def _auto_compact_due(self) -> bool:
+        """Whether a background round should be scheduled after a commit.
+
+        A round is due once the live history fills to the retention bound,
+        so the oldest stretch folds into a baseline instead of only ever
+        being pruned. A floor at the watermark leaves deliberately tiny
+        histories to ordinary retention; ``compact`` triggers a round on
+        demand regardless.
+        """
+        try:
+            numbers = self._scan_revisions()
+        except SchemaConflict:
+            return False
+        watermark = max(self.max_versions, COMPACT_WATERMARK)
+        return len(numbers) >= watermark and self._compact_targets() is not None
+
+    def _wait_background(self, timeout: float = 5.0) -> None:
+        """Let this process's own background round finish before a commit.
+
+        A commit and a compaction are serialized through one lock; rather
+        than failing against a round this same process scheduled, the
+        committing call simply waits for it. A round blocked on another
+        process gives up after ``timeout`` so the non-blocking contract
+        still holds.
+        """
+        thread = self._compact_thread
+        if (
+            thread is not None
+            and thread.is_alive()
+            and threading.current_thread() is not thread
+        ):
+            thread.join(timeout=timeout)
+
+    def _schedule_compaction(self, *, force: bool = False) -> None:
+        """Start one background compaction round if one is due.
+
+        The round is serialized with commits through the same
+        non-blocking lock and backs off briefly under contention; it
+        never blocks the committing call and never blocks reads, which
+        take no lock at all. A crash mid-round is resolved by the next
+        locked operation, so nothing here needs to be joined. A manual
+        ``compact(wait=False)`` passes ``force`` to run a round even
+        below the automatic watermark.
+        """
+        if self._compacting.is_set():
+            return
+        if not force and not self._auto_compact_due():
+            return
+        if force and self._compact_targets() is None:
+            return
+        self._compacting.set()
+
+        def run() -> None:
+            try:
+                for _attempt in range(200):
+                    try:
+                        self._lock.acquire()
+                    except SchemaConflict:
+                        # Another commit holds the lock; back off and try
+                        # again. If contention never clears, the next due
+                        # commit schedules a fresh round.
+                        time.sleep(0.02)
+                        continue
+                    try:
+                        self._compact_locked()
+                    finally:
+                        self._lock.release()
+                    return
+            except (SchemaConflict, OSError):
+                # The store is corrupt or the directory is temporarily
+                # unusable; foreground operations own reporting that, and
+                # the next due commit schedules recovery and another round.
+                pass
+            finally:
+                self._compacting.clear()
+
+        thread = threading.Thread(
+            target=run, name="schema-lens-compact", daemon=True
+        )
+        self._compact_thread = thread
+        thread.start()
+
+    def compact(self, *, wait: bool = True) -> dict:
+        """Merge the oldest stretch of revisions into one baseline.
+
+        The merged range's final schema and statistics are preserved
+        exactly; the baseline is staged as a temp product, fully validated
+        and only then published by atomically switching the compaction
+        pointer, and none of the merged originals is deleted before the
+        switch. Afterwards requests for merged revisions raise
+        ``SchemaConflict`` while the baseline and every later revision
+        read normally. With ``wait=False`` the round runs in the
+        background (the same shape commits schedule automatically) and
+        the current status is returned immediately. Returns the status;
+        with too little history to merge nothing changes.
+        """
+        self.path.mkdir(parents=True, exist_ok=True)
+        self._versions_dir.mkdir(parents=True, exist_ok=True)
+        if not wait:
+            self._schedule_compaction(force=True)
+            return self.compact_status()
+        self._wait_background()
+        with self._lock.held():
+            self._compact_locked()
+        return self.compact_status()
+
+    def compact_status(self) -> dict:
+        """Report compaction state without parsing revision files.
+
+        One directory listing and one fixed-size pointer read, regardless
+        of how many revisions are retained: ``running`` says whether a
+        round is in flight (a background round this process scheduled, or
+        a staging product another process left mid-round), ``baseline``
+        is the current baseline revision (or null), ``compacted`` lists
+        every revision number merged away, ``revisions`` lists readable
+        revisions oldest first, and ``pending`` lists those after the
+        baseline.
+        """
+        names = self._physical_names()
+        in_flight = self._compacting.is_set() or any(
+            name.endswith(COMPACT_TMP_SUFFIX) or name == BASELINE_POINTER_TMP_NAME
+            for name in names
+        )
+        numbers = self._scan_revisions()
+        pointer = self._read_pointer()
+        if pointer is None:
+            return {
+                "running": in_flight,
+                "baseline": None,
+                "compacted": [],
+                "revisions": numbers,
+                "pending": numbers,
+            }
+        baseline, replaces = pointer
+        compacted = [number for number in replaces if number != baseline]
+        return {
+            "running": in_flight,
+            "baseline": baseline,
+            "compacted": compacted,
+            "revisions": numbers,
+            "pending": [number for number in numbers if number != baseline],
+        }
 
     def load(self, *, version: int | None = None) -> None:
         """Read committed schema, replacing memory only on success.
@@ -1060,7 +1611,9 @@ class Lens:
         if isinstance(version, bool) or not isinstance(version, int) or version < 1:
             raise SchemaConflict(f"unknown schema revision: {version!r}")
         self.path.mkdir(parents=True, exist_ok=True)
+        self._wait_background()
         with self._lock.held():
+            self._recover_compaction()
             target_root = self._read_revision(version)
             head = self._read_newest()
             new_revision = 1 if head is None else head[0] + 1
@@ -1072,4 +1625,5 @@ class Lens:
         self._schema = merged
         self._base = copy.deepcopy(merged)
         self._revision = new_revision
+        self._schedule_compaction()
         return new_revision

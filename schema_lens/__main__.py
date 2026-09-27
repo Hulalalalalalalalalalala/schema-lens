@@ -67,7 +67,16 @@ def main(argv: list[str] | None = None) -> int:
         help="revision number to check against or show (default: the open snapshot)",
     )
     parser.add_argument(
-        "command", choices=["infer", "check", "show", "versions", "rollback"]
+        "command",
+        choices=[
+            "infer",
+            "check",
+            "show",
+            "versions",
+            "rollback",
+            "compact",
+            "compact-status",
+        ],
     )
     parser.add_argument(
         "target",
@@ -137,6 +146,15 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "versions":
             json.dump(lens.versions(), sys.stdout)
+            sys.stdout.write("\n")
+            return 0
+        if args.command == "compact-status":
+            json.dump(lens.compact_status(), sys.stdout, indent=2, sort_keys=True)
+            sys.stdout.write("\n")
+            return 0
+        if args.command == "compact":
+            status = lens.compact()
+            json.dump(status, sys.stdout, indent=2, sort_keys=True)
             sys.stdout.write("\n")
             return 0
         # rollback: the target schema is committed again as a new revision.

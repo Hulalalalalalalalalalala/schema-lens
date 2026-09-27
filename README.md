@@ -17,6 +17,8 @@ Python 3.11 or newer. Standard library only.
     python3 -m schema_lens --path ./lens show
     python3 -m schema_lens --path ./lens versions
     python3 -m schema_lens --path ./lens rollback <revision>
+    python3 -m schema_lens --path ./lens compact
+    python3 -m schema_lens --path ./lens compact-status
 
 `check` and `show` accept `--version <revision>` to target one specific
 committed revision; without it they use the snapshot loaded at open time.
@@ -30,6 +32,8 @@ committed revision; without it they use the snapshot loaded at open time.
 - `save() -> None` and `load(*, version=None) -> None` commit and read before replacing memory.
 - `versions() -> list[int]` lists committed revision numbers, oldest first.
 - `rollback(version) -> int` commits the target revision's schema again as a new revision and returns the new revision number.
+- `compact(*, wait=True) -> dict` merges the oldest stretch of revisions into one baseline revision and returns the compaction status.
+- `compact_status() -> dict` reports whether a compaction round is running, the current baseline, the merged-away revisions and the readable revisions.
 - `stats() -> dict` reports fields, optional fields, observed types and observation counts.
 - `SchemaConflict` exported exception.
 
@@ -90,6 +94,52 @@ it is read (including the first explicit revision read or rollback); after
 migration the legacy file is removed. A failed migration (say, an
 unwritable directory) leaves the original file byte for byte untouched and
 raises `SchemaConflict`, so the read can simply be retried later.
+
+## Background compaction
+
+The oldest stretch of retained revisions can be merged into one baseline
+revision with `compact()` (also the `compact` command); commits schedule
+the same round in the background once the live history fills to the
+compaction watermark, and `compact_status()` (the `compact-status`
+command) reports the state:
+
+- `running` — whether a round is in flight,
+- `baseline` — the current baseline revision number (or null),
+- `compacted` — the revision numbers merged into the baseline,
+- `revisions` — the readable revision numbers, oldest first,
+- `pending` — the readable revisions after the baseline.
+
+Each revision is already a complete cumulative schema, so the merged
+range's final pattern and statistics are exactly its boundary revision's:
+that revision is fully validated and copied verbatim into the baseline
+product, which keeps the boundary's revision number and reads as that
+complete revision. The product is staged under a temp name, flushed and
+fsynced, re-read from disk and structurally and checksum validated before
+a single small pointer file (`versions/baseline.json`) atomically
+switches to it; only after the switch are the merged originals deleted.
+Up to the switch every original stays readable; afterwards requests for a
+merged revision raise `SchemaConflict`, while the baseline and every later
+revision read normally.
+
+A crash or an interrupted round leaves no half state: a staging temp is
+discarded, a baseline renamed but never pointed at is treated as
+unpublished and removed, and a pointer that switched simply has its
+pending file cleanup finished by the next lock-holding operation. The
+pointer is the only switch, so a round is wholly present or wholly absent
+and the directory never holds two baselines. Reads never take the lock, so
+compaction and commits never block reads and every read lands on one
+complete revision; a read that catches the instant one baseline is
+switched for the next follows the new pointer once instead of failing.
+
+Compaction does not change any other semantics: the revision list keeps
+its oldest-first order, rollback still expresses itself as a new commit,
+history is never rewritten, one damaged revision only affects that
+revision, and type merging, optional-field judgment and mismatch reports
+are unchanged with no coercion. Resolving a revision is a constant-time
+pointer lookup, listing revisions is one directory read plus one small
+pointer file, and a round reads one revision and writes one file, so
+lookups do not scan unrelated files and a round does not re-read or
+re-merge the whole history.
 
 The merged schema also re-imposes `max_fields` after two batches merge:
 disjoint field names across batches can never leave a merged object node
