@@ -19,7 +19,6 @@ from schema_lens.core import (
     SCHEMA_VERSION,
     VERSIONS_DIRNAME,
 )
-
 try:
     import fcntl
 except ImportError:
@@ -1157,9 +1156,17 @@ class ResourceLimitTests(unittest.TestCase):
     def test_overflow_fields_are_not_unexpected_in_check(self):
         lens = Lens(self.dir.name, max_fields=1)
         lens.infer([{"a": 1, "b": 2}])
-        self.assertEqual(lens.check({"a": 1, "b": 2, "c": 3}), [])
+        # b really folded into the overflow entry, so it is checked
+        # against its widened type set rather than called unexpected.
+        self.assertEqual(lens.check({"a": 1, "b": 2}), [])
         reports = lens.check({"a": 1, "b": "x"})
         self.assertIn('$.b: type string not in field types [number]', reports)
+        # c never appeared and therefore never folded into overflow; a
+        # never-seen name is still an unexpected field.
+        self.assertEqual(
+            lens.check({"a": 1, "b": 2, "c": 3}),
+            ["$.c: unexpected field"],
+        )
 
     def test_depth_cap_collapses_nested_nodes(self):
         lens = Lens(self.dir.name, max_depth=1)
@@ -1236,6 +1243,64 @@ class ResourceLimitTests(unittest.TestCase):
         self.assertEqual(reloaded.stats()["records"], 3)
         self.assertEqual(sorted(reloaded.schema()["fields"]), ["a", "b"])
         self.assertEqual(reloaded.schema()["overflow"]["observed"], 2)
+
+    def test_overflow_records_which_names_actually_folded(self):
+        lens = Lens(self.dir.name, max_fields=2)
+        lens.infer([{"a": 1, "b": 1, "c": 2, "d": 3}])
+        self.assertEqual(lens.schema()["overflow"]["names"], ["c", "d"])
+        lens.infer([{"a": 2, "e": 4}])
+        self.assertEqual(lens.schema()["overflow"]["names"], ["c", "d", "e"])
+
+    def test_overflow_provenance_survives_commits_and_delta_merges(self):
+        lens = Lens(self.dir.name, max_fields=2)
+        lens.infer([{"a": 1, "b": 1, "c": 3}])
+        lens.save()
+        second = Lens(self.dir.name, max_fields=2)
+        second.load()
+        # c starts exact in this delta, but the disk side folded c into
+        # overflow; the merged provenance must still remember c.
+        second.infer([{"c": 9}])
+        second.save()
+        reloaded = Lens(self.dir.name, max_fields=2)
+        reloaded.load()
+        self.assertEqual(reloaded.schema()["overflow"]["names"], ["c"])
+        self.assertEqual(reloaded.check({"a": 1, "b": 1, "c": 3}), [])
+        self.assertEqual(
+            reloaded.check({"a": 1, "b": 1, "zzz": 3}),
+            ["$.zzz: unexpected field"],
+        )
+
+    def test_legacy_overflow_without_names_keeps_permissive(self):
+        from schema_lens.core import _checksum
+
+        lens = Lens(self.dir.name, max_fields=2)
+        lens.infer([{"a": 1, "b": 1, "c": 3}])
+        lens.save()
+        path = revision_path(self.dir.name, 1)
+        payload = json.loads(path.read_text())
+        del payload["root"]["overflow"]["names"]
+        payload["checksum"] = _checksum(payload["root"])
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        reloaded = Lens(self.dir.name, max_fields=2)
+        reloaded.load()
+        self.assertIsNone(reloaded.schema()["overflow"]["names"])
+        # Unknown provenance widens for any name.
+        self.assertEqual(reloaded.check({"a": 1, "b": 1, "zzz": 3}), [])
+        # Merging more batches in keeps the unknown provenance permissive.
+        reloaded.infer([{"d": 4}])
+        reloaded.save()
+        again = Lens(self.dir.name, max_fields=2)
+        again.load()
+        self.assertIsNone(again.schema()["overflow"]["names"])
+        self.assertEqual(again.check({"a": 1, "b": 1, "qqq": 3}), [])
+
+    def test_dotted_overflow_name_uses_quoted_path_in_check(self):
+        lens = Lens(self.dir.name, max_fields=1)
+        lens.infer([{"a": 1, "x.y": 2}])
+        reports = lens.check({"a": 1, "x.y": "bad"})
+        self.assertEqual(
+            reports, ['$["x.y"]: type string not in field types [number]']
+        )
 
     def test_invalid_limits_rejected(self):
         with self.assertRaises(ValueError):
@@ -1472,13 +1537,605 @@ class StreamingCliTests(unittest.TestCase):
     def test_cli_check_exit_codes_unchanged_with_limits(self):
         self._write([{"a": 1, "b": 2}])
         self._run("--path", self.lens_dir, "--max-fields", "1", "infer", self.records)
-        self._write([{"a": 2, "b": 3, "c": 4}])
+        self._write([{"a": 2, "b": 3}])
         code, _ = self._run("--path", self.lens_dir, "check", self.records)
         self.assertEqual(code, 0)
+        # A never-seen name is unexpected even though an overflow entry
+        # exists (only names that really folded into it widen).
+        self._write([{"a": 2, "b": 3, "c": 4}])
+        code, out = self._run("--path", self.lens_dir, "check", self.records)
+        self.assertEqual(code, 1)
+        self.assertIn("line 1: $.c: unexpected field", out)
         self._write([{"a": "bad"}])
         code, out = self._run("--path", self.lens_dir, "check", self.records)
         self.assertEqual(code, 1)
         self.assertIn("$.a: type string not in field types [number]", out)
+
+
+def baseline_path(directory: str, anchor: int) -> Path:
+    return Path(directory, VERSIONS_DIRNAME, f"baseline-{anchor:010d}.json")
+
+
+def _build_history(directory: str, count: int, **lens_kwargs) -> Lens:
+    lens = Lens(directory, **lens_kwargs)
+    for index in range(count):
+        lens.infer([{f"f{index}": index}, {"shared": "s"}])
+        lens.save()
+    return lens
+
+
+class CompactionTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.lens = _build_history(self.dir.name, 8, compact_keep=3)
+        self.before = {v: self.lens.schema(version=v) for v in self.lens.versions()}
+
+    def test_compact_returns_the_merged_range(self):
+        result = self.lens.compact()
+        self.assertEqual(result, {"anchor": 5, "merged": [1, 2, 3, 4, 5]})
+
+    def test_versions_after_compaction_start_at_anchor(self):
+        self.lens.compact()
+        self.assertEqual(self.lens.versions(), [5, 6, 7, 8])
+
+    def test_baseline_schema_equals_anchor(self):
+        self.lens.compact()
+        self.assertEqual(self.lens.schema(version=5), self.before[5])
+
+    def test_surviving_revisions_stay_equivalent(self):
+        self.lens.compact()
+        for version in (6, 7, 8):
+            self.assertEqual(self.lens.schema(version=version), self.before[version])
+
+    def test_merged_revisions_raise_schema_conflict(self):
+        result = self.lens.compact()
+        for version in result["merged"][:-1]:
+            with self.assertRaises(SchemaConflict):
+                self.lens.schema(version=version)
+            with self.assertRaises(SchemaConflict):
+                self.lens.check({"f0": 1}, version=version)
+            with self.assertRaises(SchemaConflict):
+                self.lens.load(version=version)
+
+    def test_merged_files_are_gone_baseline_is_the_floor(self):
+        self.lens.compact()
+        names = set(os.listdir(Path(self.dir.name, VERSIONS_DIRNAME)))
+        self.assertEqual(
+            names,
+            {
+                "manifest.json",
+                "baseline-0000000005.json",
+                "revision-0000000006.json",
+                "revision-0000000007.json",
+                "revision-0000000008.json",
+            },
+        )
+
+    def test_no_compaction_within_keep_bound(self):
+        result = self.lens.compact(keep=10)
+        self.assertIsNone(result)
+        self.assertEqual(self.lens.versions(), [1, 2, 3, 4, 5, 6, 7, 8])
+
+    def test_compaction_keeps_exact_statistics(self):
+        self.lens.compact()
+        reloaded = Lens(self.dir.name)
+        self.assertEqual(reloaded.schema(version=5), self.before[5])
+        reloaded.load()
+        self.assertEqual(reloaded.stats()["records"], 16)
+
+    def test_check_against_baseline_uses_its_schema(self):
+        self.lens.compact()
+        # f0..f4 were folded before the anchor; f5..f7 never were.
+        self.assertEqual(
+            self.lens.check({"f4": 4, "shared": "s"}, version=5), []
+        )
+        reports = self.lens.check({"f5": 5}, version=5)
+        self.assertIn("$.f5: unexpected field", reports)
+        # Surviving revisions keep their own wider schema.
+        self.assertEqual(
+            self.lens.check({"f7": 7, "shared": "s"}, version=8), []
+        )
+
+    def test_rollback_after_compaction_targets_only_live_versions(self):
+        self.lens.compact()
+        with self.assertRaises(SchemaConflict):
+            self.lens.rollback(1)
+        new_revision = self.lens.rollback(5)
+        self.assertEqual(new_revision, 9)
+        self.assertEqual(self.lens.schema(version=9), self.before[5])
+        self.assertEqual(self.lens.versions(), [5, 6, 7, 8, 9])
+
+    def test_commits_after_compaction_build_on_head(self):
+        self.lens.compact()
+        self.lens.load()
+        self.lens.infer([{"later": True}])
+        self.lens.save()
+        reloaded = Lens(self.dir.name)
+        reloaded.load()
+        fields = set(reloaded.schema()["fields"])
+        self.assertEqual(
+            fields,
+            {f"f{i}" for i in range(8)} | {"shared", "later"},
+        )
+        self.assertEqual(reloaded.versions(), [5, 6, 7, 8, 9])
+
+    def test_status_reports_baseline_and_merged(self):
+        status = self.lens.compaction_status()
+        self.assertFalse(status["running"])
+        self.assertIsNone(status["baseline"])
+        self.assertEqual(status["merged"], [])
+        self.assertEqual(status["versions"], [1, 2, 3, 4, 5, 6, 7, 8])
+        self.lens.compact()
+        status = self.lens.compaction_status()
+        self.assertEqual(status["baseline"], 5)
+        self.assertEqual(status["merged"], [1, 2, 3, 4, 5])
+        self.assertEqual(status["versions"], [5, 6, 7, 8])
+        self.assertFalse(status["running"])
+
+    def test_repeated_compaction_replaces_the_baseline(self):
+        first = self.lens.compact()
+        self.assertEqual(first["anchor"], 5)
+        for index in range(8, 12):
+            self.lens.infer([{f"f{index}": index}])
+            self.lens.save()
+        second = self.lens.compact()
+        self.assertEqual(second["merged"], [5, 6, 7, 8, 9])
+        self.assertEqual(second["anchor"], 9)
+        names = os.listdir(Path(self.dir.name, VERSIONS_DIRNAME))
+        baselines = [n for n in names if n.startswith("baseline-")]
+        self.assertEqual(baselines, ["baseline-0000000009.json"])
+        with self.assertRaises(SchemaConflict):
+            self.lens.schema(version=5)
+        self.assertEqual(self.lens.versions(), [9, 10, 11, 12])
+
+    def test_compaction_survives_reopen(self):
+        self.lens.compact()
+        fresh = Lens(self.dir.name)
+        self.assertEqual(fresh.versions(), [5, 6, 7, 8])
+        fresh.load()
+        self.assertEqual(fresh.schema(), self.lens.schema())
+        self.assertEqual(fresh.schema(version=5), self.before[5])
+
+    def test_compaction_with_capped_fields_stays_exact(self):
+        directory = tempfile.mkdtemp()
+        self.addCleanup(
+            lambda: __import__("shutil").rmtree(directory, ignore_errors=True)
+        )
+        lens = Lens(directory, max_fields=2)
+        for index in range(7):
+            lens.infer([{f"f{index}": index, "x": index}])
+            lens.save()
+        before = {v: lens.schema(version=v) for v in lens.versions()}
+        result = lens.compact(keep=2)
+        for version in lens.versions():
+            self.assertEqual(lens.schema(version=version), before[version])
+        overflow = lens.schema(version=result["anchor"])["overflow"]
+        self.assertEqual(overflow["names"], ["f1", "f2", "f3", "f4"])
+        # Only names truly folded into overflow widen.
+        self.assertEqual(
+            lens.check(
+                {"f0": 1, "x": 1, "brand_new": 1}, version=result["anchor"]
+            ),
+            ["$.brand_new: unexpected field"],
+        )
+        self.assertEqual(
+            lens.check(
+                {"f0": 1, "x": 1, "f3": "bad"}, version=result["anchor"]
+            ),
+            ["$.f3: type string not in field types [number]"],
+        )
+
+    def test_compaction_fold_includes_rollback_revisions(self):
+        directory = tempfile.mkdtemp()
+        self.addCleanup(
+            lambda: __import__("shutil").rmtree(directory, ignore_errors=True)
+        )
+        lens = Lens(directory)
+        for index in range(3):
+            lens.infer([{f"f{index}": index}])
+            lens.save()
+        lens.rollback(1)  # revision 4 is equivalent to revision 1
+        for index in range(3, 6):
+            lens.infer([{f"g{index}": index}])
+            lens.save()
+        before = {v: lens.schema(version=v) for v in lens.versions()}
+        result = lens.compact(keep=2)
+        for version in lens.versions():
+            self.assertEqual(lens.schema(version=version), before[version])
+        self.assertEqual(result["anchor"], 5)
+
+    def test_baseline_is_never_pruned_by_retention(self):
+        directory = tempfile.mkdtemp()
+        self.addCleanup(
+            lambda: __import__("shutil").rmtree(directory, ignore_errors=True)
+        )
+        lens = Lens(directory, max_versions=2, compact_keep=1)
+        for index in range(5):
+            lens.infer([{f"f{index}": index}])
+            lens.save()
+        result = lens.compact()
+        for index in range(5, 9):
+            lens.infer([{f"f{index}": index}])
+            lens.save()
+        self.assertTrue(baseline_path(directory, result["anchor"]).exists())
+        self.assertEqual(lens.versions()[0], result["anchor"])
+
+    def test_version_lookup_is_one_file_not_a_scan(self):
+        from schema_lens import core as core_module
+
+        decoded = []
+        original = core_module._decode_revision
+        try:
+            core_module._decode_revision = lambda path: (
+                decoded.append(Path(path).name) or original(path)
+            )
+            # One explicit revision decodes exactly that one file.
+            self.lens.schema(version=7)
+            self.assertEqual(decoded, ["revision-0000000007.json"])
+            self.lens.compact()
+            decoded.clear()
+            self.lens.schema(version=6)
+            self.assertEqual(decoded, ["revision-0000000006.json"])
+            decoded.clear()
+            self.lens.schema(version=5)  # anchor -> one baseline file
+            self.assertEqual(decoded, [])  # baseline uses a separate decoder
+        finally:
+            core_module._decode_revision = original
+
+    def test_versions_listing_parses_no_revision_files(self):
+        from schema_lens import core as core_module
+
+        calls = []
+        original = core_module._decode_revision
+        try:
+            core_module._decode_revision = lambda path: (
+                calls.append(path) or original(path)
+            )
+            self.assertEqual(self.lens.versions(), [1, 2, 3, 4, 5, 6, 7, 8])
+            self.lens.compact()
+            calls.clear()
+            self.assertEqual(self.lens.versions(), [5, 6, 7, 8])
+            self.assertEqual(calls, [])
+        finally:
+            core_module._decode_revision = original
+
+    def test_one_corrupt_surviving_revision_isolates(self):
+        self.lens.compact()
+        path = revision_path(self.dir.name, 7)
+        path.write_text("{broken", encoding="utf-8")
+        # Baseline and other revisions stay readable.
+        self.assertEqual(self.lens.schema(version=5), self.before[5])
+        self.assertEqual(self.lens.schema(version=6), self.before[6])
+        with self.assertRaises(SchemaConflict):
+            self.lens.schema(version=7)
+        self.assertEqual(self.lens.schema(version=8), self.before[8])
+
+    def test_corrupt_baseline_does_not_expose_merged_numbers(self):
+        result = self.lens.compact()
+        path = baseline_path(self.dir.name, result["anchor"])
+        path.write_text("{broken", encoding="utf-8")
+        with self.assertRaises(SchemaConflict):
+            self.lens.schema(version=result["anchor"])
+        # A merged-away revision stays merged-away (no file resurrection).
+        with self.assertRaises(SchemaConflict):
+            self.lens.schema(version=1)
+        self.assertEqual(self.lens.schema(version=6), self.before[6])
+
+    def test_compaction_does_not_read_the_surviving_tail(self):        # Compaction must cost less than re-reading every revision: the
+        # surviving newest revisions are never decoded to build the
+        # baseline.
+        from schema_lens import core as core_module
+
+        decoded = []
+        original = core_module._decode_revision
+
+        def spy(path):
+            decoded.append(Path(path).name)
+            return original(path)
+
+        fresh = Lens(self.dir.name, compact_keep=1)
+        for index in range(8, 11):
+            fresh.infer([{f"f{index}": index}])
+            fresh.save()
+        core_module._decode_revision = spy
+        try:
+            fresh.compact(keep=2)
+        finally:
+            core_module._decode_revision = original
+        self.assertNotIn("revision-0000000010.json", decoded)
+
+
+class CompactionCrashTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+
+    def _history(self, count=5):
+        return _build_history(self.dir.name, count)
+
+    def test_stray_baseline_without_manifest_is_rolled_back(self):
+        self._history(4)
+        versions_dir = Path(self.dir.name, VERSIONS_DIRNAME)
+        # A staged baseline that never had its manifest switched.
+        (versions_dir / "baseline-0000000002.json").write_text(
+            (versions_dir / "revision-0000000002.json").read_text(),
+            encoding="utf-8",
+        )
+        (versions_dir / "revision-0000000009.json.tmp").write_text(
+            "{half", encoding="utf-8"
+        )
+        other = Lens(self.dir.name)
+        other.infer([{"z": 1}])
+        other.save()  # taking the lock reconciles the leftovers
+        names = {p.name for p in versions_dir.iterdir()}
+        self.assertNotIn("baseline-0000000002.json", names)
+        self.assertNotIn("revision-0000000009.json.tmp", names)
+        self.assertEqual(Lens(self.dir.name).versions(), [1, 2, 3, 4, 5])
+
+    def test_manifest_without_baseline_file_is_corrupt(self):
+        lens = self._history(4)
+        result = lens.compact(keep=2)
+        os.unlink(baseline_path(self.dir.name, result["anchor"]))
+        # The pointer names a baseline that is gone; that is corruption,
+        # never a silent fallback to an older revision.
+        with self.assertRaises(SchemaConflict):
+            Lens(self.dir.name).versions()
+        with self.assertRaises(SchemaConflict):
+            Lens(self.dir.name).load()
+
+    def test_extra_baseline_after_switch_is_cleaned_up(self):
+        lens = self._history(5)
+        result = lens.compact(keep=2)
+        versions_dir = Path(self.dir.name, VERSIONS_DIRNAME)
+        stale = versions_dir / "baseline-0000000002.json"
+        stale.write_text(
+            (versions_dir / f"baseline-{result['anchor']:010d}.json").read_text(),
+            encoding="utf-8",
+        )
+        other = Lens(self.dir.name)
+        other.infer([{"z": 1}])
+        other.save()
+        self.assertFalse(stale.exists())
+        names = [n for n in os.listdir(versions_dir) if n.startswith("baseline-")]
+        self.assertEqual(names, [f"baseline-{result['anchor']:010d}.json"])
+
+    def test_merged_revision_left_after_switch_is_removed_on_reconcile(self):
+        lens = self._history(5)
+        lens.compact(keep=2)
+        versions_dir = Path(self.dir.name, VERSIONS_DIRNAME)
+        # Resurrect one merged file as if its deletion was interrupted.
+        ghost = versions_dir / "revision-0000000001.json"
+        ghost.write_text("{}", encoding="utf-8")
+        other = Lens(self.dir.name)
+        other.infer([{"z": 1}])
+        other.save()
+        self.assertFalse(ghost.exists())
+        # A directory listing cannot resurrect a compacted-away number.
+        self.assertEqual(other.versions()[0], 3)
+        with self.assertRaises(SchemaConflict):
+            other.schema(version=1)
+
+    def test_no_two_baselines_ever_coexist(self):
+        lens = self._history(6)
+        lens.compact(keep=2)
+        for index in range(6, 9):
+            lens.infer([{f"f{index}": index}])
+            lens.save()
+        lens.compact(keep=2)
+        versions_dir = Path(self.dir.name, VERSIONS_DIRNAME)
+        baselines = [
+            n for n in os.listdir(versions_dir) if n.startswith("baseline-")
+        ]
+        self.assertEqual(len(baselines), 1)
+        fresh = Lens(self.dir.name)
+        fresh.load()
+        self.assertEqual(len(fresh.versions()), 3)
+
+
+@unittest.skipIf(fcntl is None, "flock is only available on POSIX")
+class BackgroundCompactionTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.lens = _build_history(self.dir.name, 6, compact_keep=2)
+
+    def _wait(self, lens, timeout=10.0):
+        import time as _time
+
+        remaining = timeout
+        while remaining > 0 and lens.compaction_status()["running"]:
+            _time.sleep(0.02)
+            remaining -= 0.02
+        self.assertFalse(lens.compaction_status()["running"])
+
+    def test_background_compaction_eventually_switches(self):
+        from schema_lens import core as core_module
+
+        # Slow the staging decode so the run is observably in flight.
+        original = core_module._decode_revision
+
+        def slow(path):
+            import time as _time
+
+            _time.sleep(0.05)
+            return original(path)
+
+        core_module._decode_revision = slow
+        try:
+            self.lens.compact(background=True)
+            self.assertTrue(self.lens.compaction_status()["running"])
+        finally:
+            core_module._decode_revision = original
+        self._wait(self.lens)
+        status = self.lens.compaction_status()
+        self.assertIsNone(status["error"])
+        self.assertIsNotNone(status["baseline"])
+        self.assertEqual(status["versions"][0], status["baseline"])
+
+    def test_concurrent_commits_and_reads_never_see_a_broken_read(self):
+        from schema_lens import core as core_module
+
+        original = core_module._decode_revision
+
+        def slow(path):
+            import time as _time
+
+            _time.sleep(0.02)
+            return original(path)
+
+        core_module._decode_revision = slow
+        self.addCleanup(setattr, core_module, "_decode_revision", original)
+        self.lens.compact(background=True)
+
+        writer = Lens(self.dir.name)
+        writer.load()
+        bad_reads = []
+        for index in range(6, 16):
+            writer.infer([{f"f{index}": index}])
+            try:
+                writer.save()
+            except SchemaConflict:
+                pass
+            reader = Lens(self.dir.name)
+            try:
+                reader.load()
+                root = reader.schema()
+                if not isinstance(root.get("count"), int):
+                    bad_reads.append("no count")
+            except SchemaConflict as exc:
+                bad_reads.append(str(exc))
+        self._wait(self.lens)
+        self.assertEqual(bad_reads, [])
+        final = Lens(self.dir.name)
+        final.load()
+        self.assertIn("f15", final.schema()["fields"])
+        baselines = [
+            n
+            for n in os.listdir(Path(self.dir.name, VERSIONS_DIRNAME))
+            if n.startswith("baseline-")
+        ]
+        self.assertEqual(len(baselines), 1)
+
+    def test_second_background_start_while_running_conflicts(self):
+        self.lens.compact(background=True)
+        try:
+            with self.assertRaises(SchemaConflict):
+                self.lens.compact(background=True)
+        finally:
+            self._wait(self.lens)
+
+    def test_background_failure_is_reported_in_status(self):
+        from unittest import mock
+
+        with mock.patch(
+            "schema_lens.core._decode_revision",
+            side_effect=SchemaConflict("simulated corruption"),
+        ):
+            self.lens.compact(background=True)
+            self._wait(self.lens)
+        status = self.lens.compaction_status()
+        self.assertFalse(status["running"])
+        self.assertIn("simulated corruption", status["error"])
+        # Nothing switched: the history is intact and still compactable.
+        self.assertEqual(status["versions"], [1, 2, 3, 4, 5, 6])
+        self.assertTrue(self.lens.compact())
+
+
+class CompactionCliTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.lens_dir = str(Path(self.dir.name, "lens"))
+        self.records = str(Path(self.dir.name, "records.jsonl"))
+
+    def _commit(self, record):
+        with open(self.records, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(record) + "\n")
+
+    def _run(self, *argv):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = cli_main(list(argv))
+        return code, out.getvalue()
+
+    def _history(self, count):
+        for index in range(count):
+            self._commit({f"f{index}": index})
+            code, _ = self._run(
+                "--path", self.lens_dir, "infer", self.records
+            )
+            self.assertEqual(code, 0)
+
+    def test_compact_command_outputs_anchor(self):
+        self._history(5)
+        code, out = self._run(
+            "--path", self.lens_dir, "--keep", "2", "compact"
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            json.loads(out),
+            {"anchor": 3, "compacted": True, "merged": [1, 2, 3]},
+        )
+
+    def test_compact_within_bound_reports_not_compacted(self):
+        self._history(2)
+        code, out = self._run(
+            "--path", self.lens_dir, "--keep", "10", "compact"
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out), {"compacted": False})
+
+    def test_status_command_reports_state(self):
+        self._history(4)
+        code, out = self._run("--path", self.lens_dir, "status")
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            json.loads(out),
+            {
+                "baseline": None,
+                "error": None,
+                "merged": [],
+                "range": None,
+                "running": False,
+                "versions": [1, 2, 3, 4],
+            },
+        )
+        self._run("--path", self.lens_dir, "--keep", "1", "compact")
+        code, out = self._run("--path", self.lens_dir, "status")
+        status = json.loads(out)
+        self.assertEqual(status["baseline"], 3)
+        self.assertEqual(status["versions"], [3, 4])
+
+    def test_keep_only_valid_with_compact(self):
+        code, _ = self._run(
+            "--path", self.lens_dir, "--keep", "2", "versions"
+        )
+        self.assertEqual(code, 2)
+
+    def test_compact_rejects_positional_target(self):
+        code, _ = self._run("--path", self.lens_dir, "compact", "3")
+        self.assertEqual(code, 2)
+
+    def test_background_compact_detaches_and_finishes(self):
+        import time as _time
+
+        self._history(4)
+        code, out = self._run(
+            "--path", self.lens_dir, "--keep", "1",
+            "--background", "compact",
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out), {"started": True})
+        status = {}
+        for _ in range(100):
+            code, out = self._run("--path", self.lens_dir, "status")
+            status = json.loads(out)
+            if status["baseline"] is not None:
+                break
+            _time.sleep(0.05)
+        self.assertEqual(status["baseline"], 3)
+        self.assertFalse(status["running"])
 
 
 if __name__ == "__main__":

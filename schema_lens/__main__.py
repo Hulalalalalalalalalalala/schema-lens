@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from pathlib import Path
 from typing import Iterator
 
 from .core import Lens, SchemaConflict
@@ -67,12 +68,24 @@ def main(argv: list[str] | None = None) -> int:
         help="revision number to check against or show (default: the open snapshot)",
     )
     parser.add_argument(
-        "command", choices=["infer", "check", "show", "versions", "rollback"]
+        "command",
+        choices=["infer", "check", "show", "versions", "rollback", "compact", "status"],
     )
     parser.add_argument(
         "target",
         nargs="?",
         help="JSONL records file (infer/check) or revision number (rollback)",
+    )
+    parser.add_argument(
+        "--keep",
+        type=int,
+        default=None,
+        help="compact: keep at least this many newest revisions out of the baseline",
+    )
+    parser.add_argument(
+        "--background",
+        action="store_true",
+        help="compact: run the merge in the background",
     )
     try:
         args = parser.parse_args(argv)
@@ -90,6 +103,14 @@ def main(argv: list[str] | None = None) -> int:
         return fail("--version is only valid with check and show")
     if args.command in ("infer", "check") and not args.target:
         return fail(f"{args.command} requires a records file")
+    if args.keep is not None and args.command != "compact":
+        return fail("--keep is only valid with compact")
+    if args.background and args.command != "compact":
+        return fail("--background is only valid with compact")
+    if args.command == "compact" and args.target is not None:
+        return fail("compact takes no positional argument")
+    if args.command == "status" and args.target is not None:
+        return fail("status takes no positional argument")
     rollback_revision: int | None = None
     if args.command == "rollback":
         if args.target is None:
@@ -102,6 +123,8 @@ def main(argv: list[str] | None = None) -> int:
     lens_kwargs = {}
     if args.max_versions is not None:
         lens_kwargs["max_versions"] = args.max_versions
+    if args.keep is not None:
+        lens_kwargs["compact_keep"] = args.keep
     lens = Lens(
         args.path,
         max_fields=args.max_fields,
@@ -137,6 +160,49 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "versions":
             json.dump(lens.versions(), sys.stdout)
+            sys.stdout.write("\n")
+            return 0
+        if args.command == "status":
+            json.dump(lens.compaction_status(), sys.stdout, indent=2,
+                      sort_keys=True)
+            sys.stdout.write("\n")
+            return 0
+        if args.command == "compact":
+            if args.background:
+                import subprocess
+
+                log = open(Path(args.path) / "compaction.log", "a",
+                           encoding="utf-8")
+                child_argv = [
+                    sys.executable, "-m", "schema_lens",
+                    "--path", args.path,
+                ]
+                if args.max_fields is not None:
+                    child_argv += ["--max-fields", str(args.max_fields)]
+                if args.max_depth is not None:
+                    child_argv += ["--max-depth", str(args.max_depth)]
+                if args.max_versions is not None:
+                    child_argv += ["--max-versions", str(args.max_versions)]
+                if args.keep is not None:
+                    child_argv += ["--keep", str(args.keep)]
+                child_argv.append("compact")
+                subprocess.Popen(
+                    child_argv,
+                    stdin=subprocess.DEVNULL,
+                    stdout=log,
+                    stderr=log,
+                    start_new_session=True,
+                )
+                log.close()
+                json.dump({"started": True}, sys.stdout, sort_keys=True)
+                sys.stdout.write("\n")
+                return 0
+            result = lens.compact()
+            if result is None:
+                payload = {"compacted": False}
+            else:
+                payload = {"compacted": True, **result}
+            json.dump(payload, sys.stdout, sort_keys=True)
             sys.stdout.write("\n")
             return 0
         # rollback: the target schema is committed again as a new revision.

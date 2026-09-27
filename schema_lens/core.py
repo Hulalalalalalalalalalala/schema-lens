@@ -53,6 +53,20 @@ is still read; the legacy file is migrated in place into the revisions
 layout on first read, and a failed migration leaves the original file and
 the in-memory schema untouched and raises ``SchemaConflict`` so it can be
 retried later.
+
+The oldest segment of the history can be compacted into one baseline
+version. A baseline file carries the schema and statistics exactly as they
+stood at the end of the merged range (the folded tree is checked
+field-for-field against the last merged revision before the switch), and a
+small manifest in the versions directory is the single pointer naming at
+most one baseline file. Compaction stages a temp artifact, validates it
+fully, only then atomically replaces the manifest, and deletes no merged
+input until that switch has landed; a crash mid-compaction is reconciled
+into "completely happened" or "never happened" the next time the lock is
+taken. Reads never wait on a compaction: while it runs they route through
+the old manifest to complete revisions, and afterwards the baseline is
+readable as its anchor revision while the revisions merged into it answer
+``SchemaConflict``.
 """
 
 from __future__ import annotations
@@ -60,9 +74,11 @@ from __future__ import annotations
 import contextlib
 import copy
 import hashlib
+import itertools
 import json
 import os
 import threading
+import time
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
@@ -80,7 +96,11 @@ LOCK_FILENAME = "schema.lock"
 VERSIONS_DIRNAME = "versions"
 REVISION_PREFIX = "revision-"
 REVISION_SUFFIX = ".json"
+BASELINE_PREFIX = "baseline-"
+BASELINE_SUFFIX = ".json"
+MANIFEST_FILENAME = "manifest.json"
 DEFAULT_MAX_VERSIONS = 10
+DEFAULT_COMPACT_KEEP = 5
 SCHEMA_VERSION = 3
 # Version 1 files predate approximation markers; version 2 is the single
 # file layout. All three encodings carry the same node tree, so legacy
@@ -92,11 +112,47 @@ READABLE_VERSIONS = (1, 2, SCHEMA_VERSION)
 # ``$["*"]`` while the marker renders as ``$.*``).
 OVERFLOW_MARKER = "*\x00*"
 
+# Each compaction attempt stages its artifact under a unique temp name;
+# the file only takes its final baseline name by an atomic rename taken
+# under the commit lock, so concurrent compactions never overwrite each
+# other's staging file and a retried switch can never unlink a baseline a
+# winning switch already committed.
+_STAGING_COUNTER = itertools.count()
+
+
+def _staging_name() -> str:
+    return f"staging-{os.getpid()}-{next(_STAGING_COUNTER)}.tmp"
+
+
+def _write_staging(directory: Path, text: str) -> Path:
+    """Write a uniquely named, fully synced staging file in ``directory``."""
+    for _ in range(100):
+        path = directory / _staging_name()
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        except FileExistsError:
+            continue
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(text)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(path)
+            raise
+        return path
+    raise SchemaConflict("cannot allocate a compaction staging file")
+
 _KINDS = ("null", "boolean", "number", "string", "array", "object")
 
 
 class SchemaConflict(Exception):
     """Raised when an operation conflicts with the stored schema state."""
+
+
+class _RevisionMissing(SchemaConflict):
+    """Internal: a mapped revision/baseline file is not on disk (a race)."""
 
 
 def _kind_of(value: Any) -> str:
@@ -153,6 +209,45 @@ def _new_field() -> dict:
     return {"types": {}, "observed": 0, "total": 0, "optional": False}
 
 
+def _overflow_add_name(entry: dict, name: str) -> None:
+    """Record that ``name`` really folded into an overflow entry.
+
+    The list is kept sorted (and de-duplicated) so the schema tree stays
+    canonical across folds, commits and reloads. An explicit ``names:
+    None`` marks a pre-tracking overflow entry whose provenance is
+    unknown; adding a known name cannot narrow that, so it stays unknown.
+    """
+    if "names" in entry and entry["names"] is None:
+        return
+    names = entry.setdefault("names", [])
+    if name not in names:
+        names.append(name)
+        names.sort()
+
+
+def _union_overflow_names(left: dict | None, right: dict | None) -> list[str] | None:
+    """Union the folded-name provenance of two entries.
+
+    A normal exact entry carries no ``names`` key (empty provenance); an
+    explicit ``names: None`` marks an overflow entry loaded from a file
+    written before provenance was tracked, whose folded names are unknown
+    and must keep widening for every name.
+    """
+    if left is None or right is None:
+        return None
+
+    def provenance(entry: dict) -> list[str] | None:
+        if "names" not in entry:
+            return []
+        return entry["names"]
+
+    ln = provenance(left)
+    rn = provenance(right)
+    if ln is None or rn is None:
+        return None
+    return sorted(set(ln) | set(rn))
+
+
 def _fold_object(
     node: dict,
     record: dict,
@@ -178,6 +273,7 @@ def _fold_object(
                     overflow = _new_field()
                     overflow["approximate"] = True
                     node["overflow"] = overflow
+                _overflow_add_name(overflow, name)
                 overflow["observed"] += 1
                 _fold_value(overflow["types"], value, depth + 1, max_fields, max_depth)
                 continue
@@ -259,6 +355,10 @@ def _cap_object_fields(node: dict, max_fields: int | None) -> None:
                 if overflow is not None
                 else copy.deepcopy(entry)
             )
+            # The popped entry was an exact field at this node; its name is
+            # the provenance it adds to the node's overflow. Overflow
+            # provenance deeper in its type tree rides along in the merge.
+            _overflow_add_name(overflow, name)
             overflow["approximate"] = True
             node["overflow"] = overflow
     for entry in node["fields"].values():
@@ -302,15 +402,18 @@ def _merge_node(left: dict, right: dict) -> dict:
                 # The field is missing on the left; if the left capped its
                 # fields, its occurrences of this field landed in the left
                 # overflow entry, so the merged entry must absorb them and
-                # be marked approximate.
+                # be marked approximate. That field's own occurrences on
+                # the right prove its name is folded too.
                 if left_overflow is not None:
                     entry = _merge_field(left_overflow, re)
+                    _overflow_add_name(entry, name)
                     entry["approximate"] = True
                 else:
                     entry = copy.deepcopy(re)
             elif re is None:
                 if right_overflow is not None:
                     entry = _merge_field(le, right_overflow)
+                    _overflow_add_name(entry, name)
                     entry["approximate"] = True
                 else:
                     entry = copy.deepcopy(le)
@@ -355,6 +458,11 @@ def _merge_field(left: dict, right: dict) -> dict:
     entry["observed"] = left["observed"] + right["observed"]
     if left.get("approximate") or right.get("approximate"):
         entry["approximate"] = True
+    # Only overflow-ish entries carry provenance; attaching an empty list
+    # to ordinary exact entries would make the merged tree differ from a
+    # single one-shot fold over the same records.
+    if "names" in left or "names" in right:
+        entry["names"] = _union_overflow_names(left, right)
     kinds = list(left["types"]) + [
         kind for kind in right["types"] if kind not in left["types"]
     ]
@@ -415,6 +523,13 @@ def _subtract_field(mem: dict, base: dict) -> dict:
     entry["observed"] = mem["observed"] - base["observed"]
     if mem.get("approximate"):
         entry["approximate"] = True
+    mem_names = mem.get("names")
+    if mem_names is not None:
+        # The delta cannot attribute provenance per name (only aggregate
+        # counts are kept), so it carries every name its memory ever folded
+        # in; the downstream merge is a union anyway, and over-inclusion
+        # only ever widens validation for genuinely folded names.
+        entry["names"] = sorted(mem_names)
     for kind, child in mem["types"].items():
         base_child = base["types"].get(kind)
         if base_child is None:
@@ -451,12 +566,16 @@ def _check_object(node: dict, record: dict, path: str, reports: list[str]) -> No
         return
     fields = node["fields"]
     overflow = node.get("overflow")
+    overflow_names = None if overflow is None else overflow.get("names")
     for name in record:
         if name not in fields:
-            if overflow is not None:
-                # Names beyond the field cap were folded into the overflow
-                # entry; check the value against its widened type set
-                # rather than reporting the field as unexpected.
+            if overflow is not None and (
+                overflow_names is None or name in overflow_names
+            ):
+                # Only names that really folded into the overflow entry are
+                # checked against its widened type set; ``names is None``
+                # marks a legacy overflow entry with unknown provenance. A
+                # name never seen before is still unexpected.
                 _check_value(overflow["types"], record[name], _join(path, name), reports)
             else:
                 reports.append(f"{_join(path, name)}: unexpected field")
@@ -480,6 +599,33 @@ def _check_value(types: dict, value: Any, path: str, reports: list[str]) -> None
     elif kind == "array":
         for index, element in enumerate(value):
             _check_value(node["elements"], element, f"{path}[{index}]", reports)
+
+
+def _normalize_overflow_names(node: Any) -> None:
+    """Mark pre-tracking overflow entries with explicit ``names: None``.
+
+    Files written before folded names were tracked carry overflow entries
+    without a ``names`` key; unlike an exact entry (which also omits the
+    key), their provenance is unknown and must stay permissive through
+    merges. Exact entries are never reached here.
+    """
+    if not isinstance(node, dict):
+        return
+    kind = node.get("kind")
+    if kind == "object" and not _is_collapsed(node):
+        overflow = node.get("overflow")
+        if overflow is not None and "names" not in overflow:
+            overflow["names"] = None
+        fields = node.get("fields") or {}
+        for entry in fields.values():
+            for child in (entry.get("types") or {}).values():
+                _normalize_overflow_names(child)
+        if overflow is not None:
+            for child in (overflow.get("types") or {}).values():
+                _normalize_overflow_names(child)
+    elif kind == "array":
+        for child in (node.get("elements") or {}).values():
+            _normalize_overflow_names(child)
 
 
 def _validate_node(node: Any) -> None:
@@ -522,6 +668,7 @@ def _validate_field(entry: Any) -> None:
     total = entry.get("total")
     optional = entry.get("optional")
     approximate = entry.get("approximate", False)
+    names = entry.get("names")
     if (
         not isinstance(types, dict)
         or isinstance(observed, bool)
@@ -530,6 +677,13 @@ def _validate_field(entry: Any) -> None:
         or not isinstance(total, int)
         or not isinstance(optional, bool)
         or not isinstance(approximate, bool)
+        or (
+            names is not None
+            and (
+                not isinstance(names, list)
+                or any(not isinstance(name, str) for name in names)
+            )
+        )
     ):
         raise SchemaConflict("corrupt schema revision: malformed field entry")
     for child in types.values():
@@ -559,6 +713,7 @@ def _validate_payload(payload: Any) -> tuple[int, dict]:
         raise SchemaConflict("corrupt schema revision: root must be an object")
     if _checksum(root) != checksum:
         raise SchemaConflict("corrupt schema revision: checksum mismatch")
+    _normalize_overflow_names(root)
     return version, root
 
 
@@ -598,6 +753,24 @@ def _revision_path(directory: Path, revision: int) -> Path:
     return directory / f"{REVISION_PREFIX}{revision:010d}{REVISION_SUFFIX}"
 
 
+def _baseline_path(directory: Path, anchor: int) -> Path:
+    return directory / f"{BASELINE_PREFIX}{anchor:010d}{BASELINE_SUFFIX}"
+
+
+def _baseline_anchor(name: str) -> int | None:
+    if not (
+        name.startswith(BASELINE_PREFIX)
+        and name.endswith(BASELINE_SUFFIX)
+        and len(name)
+        == len(BASELINE_PREFIX) + 10 + len(BASELINE_SUFFIX)
+    ):
+        return None
+    digits = name[len(BASELINE_PREFIX) : -len(BASELINE_SUFFIX)]
+    if not digits.isdigit():
+        return None
+    return int(digits)
+
+
 def _revision_number(name: str) -> int | None:
     if not (
         name.startswith(REVISION_PREFIX)
@@ -622,12 +795,74 @@ def _encode_revision(revision: int, root: dict) -> str:
     return json.dumps(payload, indent=2, sort_keys=True) + "\n"
 
 
+def _encode_baseline(anchor: int, root: dict) -> str:
+    payload = {
+        "version": SCHEMA_VERSION,
+        "kind": "baseline",
+        "anchor": anchor,
+        "checksum": _checksum(root),
+        "root": root,
+    }
+    return json.dumps(payload, indent=2, sort_keys=True) + "\n"
+
+
+def _validate_baseline_payload(payload: Any) -> tuple[int, dict]:
+    if not isinstance(payload, dict):
+        raise SchemaConflict("corrupt schema baseline: not a JSON object")
+    version = payload.get("version")
+    if version != SCHEMA_VERSION:
+        raise SchemaConflict(f"unsupported schema baseline version: {version!r}")
+    if payload.get("kind") != "baseline":
+        raise SchemaConflict("corrupt schema baseline: wrong payload kind")
+    anchor = payload.get("anchor")
+    if isinstance(anchor, bool) or not isinstance(anchor, int) or anchor < 1:
+        raise SchemaConflict("corrupt schema baseline: malformed anchor")
+    checksum = payload.get("checksum")
+    if not isinstance(checksum, str):
+        raise SchemaConflict("corrupt schema baseline: missing checksum")
+    if "root" not in payload:
+        raise SchemaConflict("corrupt schema baseline: missing root")
+    root = payload["root"]
+    _validate_node(root)
+    if not isinstance(root, dict) or root.get("kind") != "object":
+        raise SchemaConflict("corrupt schema baseline: root must be an object")
+    if _checksum(root) != checksum:
+        raise SchemaConflict("corrupt schema baseline: checksum mismatch")
+    _normalize_overflow_names(root)
+    return anchor, root
+
+
+def _decode_baseline(file_path: Path) -> tuple[int, dict]:
+    """Read one baseline file and validate it completely before use."""
+    try:
+        raw = file_path.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise _RevisionMissing(
+            f"schema baseline not found: {file_path.name}"
+        ) from exc
+    except OSError as exc:
+        raise SchemaConflict(f"cannot read schema baseline {file_path}: {exc}") from exc
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise SchemaConflict(f"corrupt schema baseline {file_path.name}: {exc}") from exc
+    anchor, root = _validate_baseline_payload(payload)
+    number_from_name = _baseline_anchor(file_path.name)
+    if number_from_name is not None and number_from_name != anchor:
+        raise SchemaConflict(
+            f"corrupt schema baseline {file_path.name}: anchor mismatch"
+        )
+    return anchor, root
+
+
 def _decode_revision(file_path: Path) -> tuple[int, dict]:
     """Read one revision file and validate it completely before use."""
     try:
         raw = file_path.read_text(encoding="utf-8")
     except FileNotFoundError as exc:
-        raise SchemaConflict(f"schema revision not found: {file_path.name}") from exc
+        raise _RevisionMissing(
+            f"schema revision not found: {file_path.name}"
+        ) from exc
     except OSError as exc:
         raise SchemaConflict(f"cannot read schema revision {file_path}: {exc}") from exc
     try:
@@ -727,6 +962,12 @@ class Lens:
     first never being touched. It defaults to 10 and must be a positive
     integer. A revision pruned by retention is no longer readable or a
     valid rollback target.
+
+    ``compact(keep=...)`` merges the oldest segment of the history into one
+    baseline version, keeping at least the newest ``keep`` revisions
+    separate (default 5); ``compact(background=True)`` runs the merge in a
+    background thread without blocking the caller. ``compaction_status()``
+    reports whether such a run is in progress and the range it covers.
     """
 
     def __init__(
@@ -736,6 +977,7 @@ class Lens:
         max_fields: int | None = None,
         max_depth: int | None = None,
         max_versions: int = DEFAULT_MAX_VERSIONS,
+        compact_keep: int = DEFAULT_COMPACT_KEEP,
     ) -> None:
         for label, value in (("max_fields", max_fields), ("max_depth", max_depth)):
             if value is not None and (
@@ -748,14 +990,25 @@ class Lens:
             or max_versions < 1
         ):
             raise ValueError("max_versions must be a positive integer")
+        if (
+            isinstance(compact_keep, bool)
+            or not isinstance(compact_keep, int)
+            or compact_keep < 1
+        ):
+            raise ValueError("compact_keep must be a positive integer")
         self.path = Path(path)
         self.max_fields = max_fields
         self.max_depth = max_depth
         self.max_versions = max_versions
+        self.compact_keep = compact_keep
         self._schema: dict | None = None
         self._base: dict | None = None
         self._revision: int | None = None
         self._lock = _DirectoryLock(self.path)
+        self._bg_thread: threading.Thread | None = None
+        self._bg_error: Exception | None = None
+        self._bg_range: tuple[int, int] | None = None
+        self._bg_lock = threading.Lock()
 
     @property
     def _legacy_file(self) -> Path:
@@ -875,6 +1128,85 @@ class Lens:
 
     # -- revision storage -------------------------------------------------
 
+    def _manifest_path(self) -> Path:
+        return self._versions_dir / MANIFEST_FILENAME
+
+    def _read_manifest(self) -> dict | None:
+        """Read the manifest pointer, or ``None`` when no compaction ran.
+
+        The manifest is the single pointer naming at most one baseline
+        file; it only ever appears by an atomic replace, so a present file
+        is always complete, though its content and every reference in it
+        are still validated here. The named baseline file must exist as
+        well (a cheap stat, no parsing); a pointer that names a missing
+        baseline is corruption rather than a silent fallback.
+        """
+        data = self._load_manifest_file()
+        if data is not None and data["baseline"] is not None:
+            if not (self._versions_dir / data["baseline"]["file"]).exists():
+                # A newer compaction may have switched and removed the old
+                # baseline between the read and the stat; re-read once.
+                fresh = self._load_manifest_file()
+                if fresh != data:
+                    return fresh
+                raise SchemaConflict(
+                    f"compaction manifest names missing baseline "
+                    f"{data['baseline']['file']}"
+                )
+        return data
+
+    def _load_manifest_file(self) -> dict | None:
+        try:
+            raw = self._manifest_path().read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise SchemaConflict(
+                f"cannot read compaction manifest {self._manifest_path()}: {exc}"
+            ) from exc
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise SchemaConflict(f"corrupt compaction manifest: {exc}") from exc
+        return self._validate_manifest(payload)
+
+    def _validate_manifest(self, payload: Any) -> dict:
+        if not isinstance(payload, dict) or payload.get("version") != 1:
+            raise SchemaConflict("corrupt compaction manifest: malformed payload")
+        baseline = payload.get("baseline")
+        if baseline is None:
+            return {"baseline": None}
+        if not isinstance(baseline, dict):
+            raise SchemaConflict("corrupt compaction manifest: malformed baseline")
+        anchor = baseline.get("anchor")
+        merged = baseline.get("merged")
+        file_name = baseline.get("file")
+        expected_file = f"{BASELINE_PREFIX}{anchor:010d}{BASELINE_SUFFIX}"
+        if (
+            isinstance(anchor, bool)
+            or not isinstance(anchor, int)
+            or anchor < 1
+            or not isinstance(merged, list)
+            or any(isinstance(n, bool) or not isinstance(n, int) or n < 1 for n in merged)
+            or sorted(set(merged)) != sorted(merged)
+            or not merged
+            or merged[-1] != anchor
+            or file_name != expected_file
+        ):
+            raise SchemaConflict("corrupt compaction manifest: malformed baseline")
+        return {
+            "baseline": {
+                "anchor": anchor,
+                "merged": sorted(merged),
+                "file": file_name,
+            }
+        }
+
+    def _write_manifest_locked(self, baseline: dict | None) -> None:
+        payload = {"version": 1, "baseline": baseline}
+        _write_atomic(self._manifest_path(), json.dumps(payload, indent=2,
+                                                         sort_keys=True) + "\n")
+
     def _scan_revisions(self) -> list[int]:
         """Numbers of complete-looking revision files, oldest first.
 
@@ -892,26 +1224,99 @@ class Lens:
         numbers = [number for name in names if (number := _revision_number(name))]
         return sorted(set(numbers))
 
+    def _logical_versions(self, manifest: dict | None) -> list[int]:
+        """Ordered logical history through the manifest pointer.
+
+        A directory listing plus the manifest is enough; no revision file
+        is parsed to build the list.
+        """
+        numbers = self._scan_revisions()
+        baseline = manifest.get("baseline") if manifest else None
+        if baseline is None:
+            return numbers
+        anchor = baseline["anchor"]
+        return [anchor] + [n for n in numbers if n > anchor]
+
+    def _resolve_version(self, revision: int, manifest: dict | None) -> Path:
+        """Map a logical revision number to its file without parsing files.
+
+        The baseline anchor routes to the baseline file; revisions merged
+        into it are gone and raise; everything else routes by its number.
+        """
+        baseline = manifest.get("baseline") if manifest else None
+        if baseline is not None:
+            if revision == baseline["anchor"]:
+                return self._versions_dir / baseline["file"]
+            if revision in baseline["merged"]:
+                raise SchemaConflict(
+                    f"schema revision {revision} was compacted into baseline "
+                    f"revision {baseline['anchor']}"
+                )
+        return _revision_path(self._versions_dir, revision)
+
+    def _read_version(self, revision: int) -> dict:
+        """Read and fully validate one logical revision (revision or anchor)."""
+        manifest = self._read_manifest()
+        try:
+            return self._decode_at(revision, manifest)
+        except SchemaConflict as exc:
+            # The pointer may have switched (or retention pruned) between
+            # the manifest read and opening the file; re-resolve once
+            # against the current pointer so a merged-away revision names
+            # itself as compacted instead of missing.
+            fresh = self._read_manifest()
+            if fresh == manifest:
+                raise
+            return self._decode_at(revision, fresh)
+
+    def _decode_at(self, revision: int, manifest: dict | None) -> dict:
+        path = self._resolve_version(revision, manifest)
+        info = manifest.get("baseline") if manifest else None
+        if info is not None and revision == info["anchor"]:
+            return _decode_baseline(path)[1]
+        return _decode_revision(path)[1]
+
     def _read_revision(self, revision: int) -> dict:
         if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
             raise SchemaConflict(f"unknown schema revision: {revision!r}")
-        target = _revision_path(self._versions_dir, revision)
-        if not target.exists() and not self._scan_revisions():
-            # No revision store yet: an old single-file layout may carry
-            # the schema; migrate it in place, then honor the request.
+        manifest = self._read_manifest()
+        if manifest is None and not self._scan_revisions():
+            # No revision store and no pointer yet: an old single-file
+            # layout may carry the schema; migrate it in place first.
             self._migrate_legacy()
-        return _decode_revision(target)[1]
+        return self._read_version(revision)
 
     def _read_newest(self) -> tuple[int, dict] | None:
-        numbers = self._scan_revisions()
-        if not numbers:
+        manifest = self._read_manifest()
+        history = self._logical_versions(manifest)
+        if not history:
             return None
-        # A revision file only appears by an atomic rename of a fully
-        # synced file, so the newest numbered file is complete or absent;
-        # if its content does not validate the stored state is corrupt and
-        # the caller gets SchemaConflict instead of an older schema.
-        revision = numbers[-1]
-        return _decode_revision(_revision_path(self._versions_dir, revision))
+        revision = history[-1]
+        try:
+            return self._decode_head(revision, manifest)
+        except SchemaConflict:
+            # A compaction switch or retention prune can land between
+            # listing and opening the file; re-resolve once.
+            fresh = self._read_manifest()
+            fresh_history = self._logical_versions(fresh)
+            if not fresh_history or (
+                fresh == manifest and fresh_history == history
+            ):
+                raise
+            revision = fresh_history[-1]
+            return self._decode_head(revision, fresh)
+
+    def _decode_head(self, revision: int, manifest: dict | None) -> tuple[int, dict]:
+        path = self._resolve_version(revision, manifest)
+        info = manifest.get("baseline") if manifest else None
+        # A revision or baseline file only appears by an atomic rename of a
+        # fully synced file, so the newest logical version is complete or
+        # absent; if its content does not validate the stored state is
+        # corrupt and the caller gets SchemaConflict instead of an older
+        # schema.
+        if info is not None and revision == info["anchor"]:
+            return _decode_baseline(path)
+        return _decode_revision(path)
 
     def _migrate_legacy(self) -> tuple[int, dict] | None:
         """Migrate the old single-file layout into one revision.
@@ -966,15 +1371,22 @@ class Lens:
         return None
 
     def versions(self) -> list[int]:
-        """Committed revision numbers, oldest first; empty before any commit."""
-        return self._scan_revisions()
+        """Logical version numbers, oldest first; empty before any commit.
+
+        The baseline anchor is the first number after a compaction;
+        revisions merged into it are not listed. Building the list takes a
+        directory listing and a manifest read - no revision file is
+        parsed.
+        """
+        return self._logical_versions(self._read_manifest())
 
     def save(self) -> None:
         """Commit the stored schema into the lens directory.
 
         The commit is serialized by a non-blocking lock file in the
         directory; contention raises SchemaConflict and the in-memory
-        batch stays retryable. Under the lock the newest complete
+        batch stays retryable. Under the lock leftover artifacts of an
+        interrupted compaction are reconciled, the newest complete
         revision is read and fully validated, the records folded since the
         last load or save are merged in, the field cap is re-imposed on
         the merged tree, and the result is written as a brand new complete
@@ -986,6 +1398,7 @@ class Lens:
         self._require()
         self.path.mkdir(parents=True, exist_ok=True)
         with self._lock.held():
+            self._reconcile_locked()
             head = self._read_head()
             if head is None:
                 revision = 1
@@ -1010,8 +1423,8 @@ class Lens:
         """Remove complete revisions beyond the retention bound.
 
         Only numbered revision files older than ``newest - max_versions +
-        1`` are removed; the newest ``max_versions`` revisions and any
-        other file in the directory are left alone.
+        1`` are removed; the baseline file, the newest ``max_versions``
+        revisions and any other file in the directory are left alone.
         """
         cutoff = newest - self.max_versions
         if cutoff < 1:
@@ -1029,9 +1442,9 @@ class Lens:
 
         With ``version`` omitted the newest complete revision is read (and
         a legacy single-file layout migrated in place); with a number
-        given that exact revision is read and fully validated. A missing
-        revision or a corrupt file raises ``SchemaConflict`` and leaves
-        memory exactly as it was.
+        given that exact revision is read and fully validated. A missing,
+        compacted-away or corrupt revision raises ``SchemaConflict`` and
+        leaves memory exactly as it was.
         """
         if version is None:
             head = self._read_head()
@@ -1053,14 +1466,15 @@ class Lens:
         History is never rewritten: the target revision stays put and a
         brand new revision carrying an equivalent schema is committed on
         top of it, so the revision list keeps growing. Rolling back to a
-        revision that does not exist or fails validation raises
-        ``SchemaConflict`` and changes no committed revision. Returns the
-        new revision number; the in-memory snapshot adopts it.
+        revision that is missing, compacted away or fails validation
+        raises ``SchemaConflict`` and changes no committed revision.
+        Returns the new revision number; the in-memory snapshot adopts it.
         """
         if isinstance(version, bool) or not isinstance(version, int) or version < 1:
             raise SchemaConflict(f"unknown schema revision: {version!r}")
         self.path.mkdir(parents=True, exist_ok=True)
         with self._lock.held():
+            self._reconcile_locked()
             target_root = self._read_revision(version)
             head = self._read_newest()
             new_revision = 1 if head is None else head[0] + 1
@@ -1073,3 +1487,352 @@ class Lens:
         self._base = copy.deepcopy(merged)
         self._revision = new_revision
         return new_revision
+
+    # -- compaction -------------------------------------------------------
+
+    def _reconcile_locked(self, *, preserve: str | None = None) -> None:
+        """Resolve a crash or interruption into one finished state.
+
+        With a committed manifest, its baseline must exist and validate;
+        merged inputs left on disk by a crash after the switch are removed.
+        Without one, every staged or stray baseline artifact is an
+        interrupted compaction that never switched and is removed. Staging
+        temp files are likewise leftovers of attempts that never switched
+        (a concurrent attempt whose file is removed here simply retries and
+        re-stages); the one file named by ``preserve`` belongs to the
+        attempt driving this reconcile and is left alone.
+        """
+        try:
+            names = os.listdir(self._versions_dir)
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise SchemaConflict(
+                f"cannot read versions directory {self._versions_dir}: {exc}"
+            ) from exc
+        baselines = {
+            anchor: name
+            for name in names
+            if (anchor := _baseline_anchor(name)) is not None
+        }
+        temps = {
+            name for name in names if name.endswith(".tmp") and name != preserve
+        }
+        manifest = self._read_manifest()
+        changed = False
+        info = manifest.get("baseline") if manifest else None
+        if info is not None:
+            anchor = info["anchor"]
+            if anchor not in baselines or baselines[anchor] != info["file"]:
+                raise SchemaConflict(
+                    f"compaction manifest names missing baseline "
+                    f"{info['file']}"
+                )
+            _decode_baseline(self._versions_dir / info["file"])
+            for other in list(baselines):
+                if other != anchor:
+                    os.unlink(self._versions_dir / baselines[other])
+                    changed = True
+            for merged_revision in info["merged"]:
+                path = _revision_path(self._versions_dir, merged_revision)
+                try:
+                    os.unlink(path)
+                    changed = True
+                except FileNotFoundError:
+                    pass
+        else:
+            for anchor, name in baselines.items():
+                os.unlink(self._versions_dir / name)
+                changed = True
+        for name in temps:
+            os.unlink(self._versions_dir / name)
+            changed = True
+        if changed:
+            _fsync_dir(self._versions_dir)
+
+    def compact(
+        self,
+        *,
+        keep: int | None = None,
+        background: bool = False,
+    ) -> dict | None:
+        """Merge the oldest history segment into one baseline version.
+
+        At least the newest ``keep`` revisions (default
+        ``compact_keep``) stay separate; everything older folds into a
+        single baseline version whose schema and statistics are exactly
+        those of the last merged revision. The merged tree is built from
+        immutable files without taking the commit lock, staged as a temp
+        artifact, and switched in only after a full self-check against the
+        anchor; the revisions being merged are not deleted until the
+        manifest pointer has atomically switched. A crash therefore leaves
+        either the whole compaction or none of it. Returns a description
+        of the new baseline, or ``None`` when the history is already at or
+        below ``keep`` versions.
+
+        With ``background=True`` the merge runs in a background thread
+        (neither commits nor reads wait on it) and the call returns
+        immediately; poll ``compaction_status`` for progress.
+        """
+        keep = self.compact_keep if keep is None else keep
+        if isinstance(keep, bool) or not isinstance(keep, int) or keep < 1:
+            raise ValueError("keep must be a positive integer")
+        if background:
+            with self._bg_lock:
+                if self._bg_thread is not None and self._bg_thread.is_alive():
+                    raise SchemaConflict("a background compaction is already running")
+                self._bg_error = None
+                self._bg_range = None
+                thread = threading.Thread(
+                    target=self._compact_in_background,
+                    args=(keep,),
+                    name="schema-lens-compaction",
+                    daemon=True,
+                )
+                self._bg_thread = thread
+            thread.start()
+            return None
+        return self._compact_loop(keep)
+
+    def _compact_in_background(self, keep: int) -> None:
+        try:
+            worker = Lens(
+                self.path,
+                max_fields=self.max_fields,
+                max_depth=self.max_depth,
+                max_versions=self.max_versions,
+                compact_keep=keep,
+            )
+            worker._compact_loop(keep, range_sink=self._note_bg_range)
+        except BaseException as exc:  # reported through compaction_status
+            with self._bg_lock:
+                self._bg_error = exc
+
+    def _note_bg_range(self, merged: list[int] | None) -> None:
+        with self._bg_lock:
+            self._bg_range = None if not merged else [merged[0], merged[-1]]
+
+    def compaction_status(self) -> dict:
+        """Report the committed baseline and any in-progress compaction.
+
+        Keys: ``"running"`` (a background compaction started on this lens
+        is still going), ``"range"`` (the ``[first, last]`` merged range
+        of that run), ``"baseline"`` (anchor of the committed baseline or
+        ``None``), ``"merged"`` (every revision folded into it),
+        ``"versions"`` (the logical history), and ``"error"`` (last
+        background failure message, if any).
+        """
+        with self._bg_lock:
+            thread = self._bg_thread
+            running = bool(thread is not None and thread.is_alive())
+            bg_range = list(self._bg_range) if self._bg_range is not None else None
+            error = None if self._bg_error is None else str(self._bg_error)
+        manifest = self._read_manifest()
+        info = manifest.get("baseline") if manifest else None
+        return {
+            "running": running,
+            "range": bg_range,
+            "baseline": None if info is None else info["anchor"],
+            "merged": [] if info is None else list(info["merged"]),
+            "versions": self._logical_versions(manifest),
+            "error": error,
+        }
+
+    def _compact_loop(
+        self,
+        keep: int,
+        *,
+        range_sink: Any = None,
+        attempts: int = 50,
+    ) -> dict | None:
+        """Run compaction attempts until one switches or the budget is spent.
+
+        Building and self-checking the baseline never touches the commit
+        lock; only the final pointer switch is serialized with commits, so
+        a history that moved under a concurrent commit simply retries on a
+        fresh range instead of blocking readers or writers.
+        """
+        last: Exception | None = None
+        for attempt in range(attempts):
+            try:
+                staged = self._stage_compaction(keep, range_sink)
+                if staged is None:
+                    return None
+                return self._switch_compaction(staged)
+            except _CompactionFatal:
+                raise
+            except (_CompactionRetry, _RevisionMissing) as exc:
+                # The commit lock was busy, the pointer moved, or a file
+                # vanished under a concurrent commit; a fresh attempt on
+                # the current history settles it.
+                last = exc
+                time.sleep(min(0.02 * (attempt + 1), 0.1))
+            except OSError as exc:
+                last = exc
+                time.sleep(min(0.02 * (attempt + 1), 0.1))
+        raise SchemaConflict(f"compaction could not settle: {last}")
+
+    def _stage_compaction(
+        self, keep: int, range_sink: Any
+    ) -> dict | None:
+        """Build and self-check the baseline artifact without the lock."""
+        manifest = self._read_manifest()
+        history = self._logical_versions(manifest)
+        if len(history) <= keep:
+            if range_sink is not None:
+                range_sink(None)
+            return None
+        merged = history[: len(history) - keep]
+        anchor = merged[-1]
+        info = manifest.get("baseline") if manifest else None
+        if info is not None and anchor == info["anchor"]:
+            # The segment folds no new revision into the existing
+            # baseline, so there is nothing to compact.
+            if range_sink is not None:
+                range_sink(None)
+            return None
+
+        # Fold the segment exactly the way commits build on each other:
+        # merge the previous folded tree with the next revision's delta,
+        # refresh and re-impose the cap. A revision that cannot be derived
+        # this way (one produced by ``rollback``) is a reset point - the
+        # fold restarts there, so the result still ends exactly equal to
+        # the anchor revision rather than drifting.
+        acc: dict | None = None
+        previous: dict | None = None
+        anchor_root: dict | None = None
+        for number in merged:
+            path = self._resolve_version(number, manifest)
+            try:
+                if info is not None and number == info["anchor"]:
+                    _anchor_number, root = _decode_baseline(path)
+                else:
+                    _number, root = _decode_revision(path)
+            except _RevisionMissing as exc:
+                raise _CompactionRetry(str(exc)) from exc
+            if acc is None:
+                acc = copy.deepcopy(root)
+            else:
+                candidate = _merge_node(acc, _subtract_node(root, previous))
+                _refresh_node(candidate)
+                _cap_node_fields(candidate, self.max_fields)
+                _refresh_node(candidate)
+                acc = candidate if candidate == root else copy.deepcopy(root)
+            previous = root
+            anchor_root = root
+        assert acc is not None and anchor_root is not None
+
+        # The fold must reproduce the anchor revision's schema and
+        # statistics exactly; nothing switches unless it does.
+        if acc != anchor_root:
+            raise _CompactionFatal(
+                "compaction self-check failed: merged schema does not match "
+                f"revision {anchor}"
+            )
+
+        self._versions_dir.mkdir(parents=True, exist_ok=True)
+        staging_path = _write_staging(
+            self._versions_dir, _encode_baseline(anchor, acc)
+        )
+        try:
+            disk_anchor, disk_root = _decode_baseline(staging_path)
+            if disk_anchor != anchor or disk_root != anchor_root:
+                raise _CompactionFatal(
+                    "compaction self-check failed: staged baseline does not "
+                    f"match revision {anchor}"
+                )
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(staging_path)
+            raise
+        return {
+            "anchor": anchor,
+            "merged": list(merged),
+            "staging": staging_path.name,
+            "old_anchor": None if info is None else info["anchor"],
+        }
+
+    def _switch_compaction(self, staged: dict) -> dict:
+        """Rename the staged artifact in under the lock and switch pointer."""
+        anchor = staged["anchor"]
+        merged = staged["merged"]
+        old_anchor = staged["old_anchor"]
+        staging_name = staged["staging"]
+        acquired = False
+        try:
+            try:
+                self._lock.acquire()
+            except SchemaConflict:
+                raise _CompactionRetry("commit lock busy")
+            acquired = True
+            self._reconcile_locked(preserve=staging_name)
+            staging_path = self._versions_dir / staging_name
+            if not staging_path.exists():
+                # A concurrent lock holder reconciled this attempt's
+                # staging file away; a fresh attempt re-stages.
+                raise _CompactionRetry("staging file collected before switch")
+            manifest = self._read_manifest()
+            info = manifest.get("baseline") if manifest else None
+            current_anchor = None if info is None else info["anchor"]
+            if current_anchor != old_anchor:
+                # Another compaction switched while this one was staging;
+                # let the next attempt fold from the new floor.
+                raise _CompactionRetry(
+                    "baseline pointer changed during compaction"
+                )
+            # The immutable inputs must still be exactly as staged; if
+            # retention or a crash removed any of them the range moved.
+            for number in merged:
+                if number == old_anchor:
+                    continue
+                if not _revision_path(self._versions_dir, number).exists():
+                    raise _CompactionRetry(
+                        f"revision {number} disappeared during compaction"
+                    )
+            final_path = _baseline_path(self._versions_dir, anchor)
+            # The artifact takes its real baseline name inside the lock.
+            # Its unique O_EXCL staging name means it could only have been
+            # removed (handled above), never replaced, so the full
+            # validation done right after staging still holds.
+            os.replace(staging_path, final_path)
+            _fsync_dir(self._versions_dir)
+            self._write_manifest_locked(
+                {
+                    "anchor": anchor,
+                    "file": final_path.name,
+                    "merged": merged,
+                }
+            )
+            # Pointer switched: only now may the merged inputs go away -
+            # the old baseline included, so exactly one baseline remains.
+            for number in merged:
+                if number == old_anchor:
+                    continue
+                try:
+                    os.unlink(_revision_path(self._versions_dir, number))
+                except FileNotFoundError:
+                    pass
+            if old_anchor is not None:
+                try:
+                    os.unlink(_baseline_path(self._versions_dir, old_anchor))
+                except FileNotFoundError:
+                    pass
+            _fsync_dir(self._versions_dir)
+        except _CompactionRetry:
+            with contextlib.suppress(OSError):
+                os.unlink(self._versions_dir / staging_name)
+            if acquired:
+                _fsync_dir(self._versions_dir)
+            raise
+        finally:
+            if acquired:
+                self._lock.release()
+        return {"anchor": anchor, "merged": merged}
+
+
+class _CompactionRetry(SchemaConflict):
+    """Internal: the history moved; retry the compaction on a fresh range."""
+
+
+class _CompactionFatal(SchemaConflict):
+    """Internal: a compaction self-check failed; retrying cannot help."""

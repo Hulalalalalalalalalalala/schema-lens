@@ -17,6 +17,8 @@ Python 3.11 or newer. Standard library only.
     python3 -m schema_lens --path ./lens show
     python3 -m schema_lens --path ./lens versions
     python3 -m schema_lens --path ./lens rollback <revision>
+    python3 -m schema_lens --path ./lens compact [--keep <revisions>] [--background]
+    python3 -m schema_lens --path ./lens status
 
 `check` and `show` accept `--version <revision>` to target one specific
 committed revision; without it they use the snapshot loaded at open time.
@@ -30,6 +32,8 @@ committed revision; without it they use the snapshot loaded at open time.
 - `save() -> None` and `load(*, version=None) -> None` commit and read before replacing memory.
 - `versions() -> list[int]` lists committed revision numbers, oldest first.
 - `rollback(version) -> int` commits the target revision's schema again as a new revision and returns the new revision number.
+- `compact(*, keep=None, background=False) -> dict | None` merges the oldest history segment into one baseline version and returns `{"anchor": ..., "merged": [...]}` (or `None` when the history is already within the keep bound).
+- `compaction_status() -> dict` reports the committed baseline, the revisions merged into it, the live logical history and any background run in progress.
 - `stats() -> dict` reports fields, optional fields, observed types and observation counts.
 - `SchemaConflict` exported exception.
 
@@ -83,6 +87,57 @@ returned revision is what subsequent unqualified reads see. Rolling back
 to a revision that is missing, pruned or corrupt raises `SchemaConflict`
 and changes no committed revision.
 
+## Background compaction
+
+`compact(keep=N)` merges the oldest segment of the history into one
+baseline version: at least the newest `N` revisions (default 5, or the
+`compact_keep=` constructor argument / `--keep` option) stay separate and
+every revision older than that folds into a single baseline whose schema
+and statistics are exactly those of the last merged revision (its anchor).
+The baseline is stored as `versions/baseline-<anchor>.json` with the same
+checksum guarantees as a revision, and a small `versions/manifest.json` is
+the single pointer naming it. After compaction:
+
+- the anchor is readable as its own revision number (via `schema`,
+  `check`, `load` and as a `rollback` target) and answers exactly as the
+  original anchor revision did;
+- the other revisions merged into the baseline are no longer readable -
+  requesting them (explicitly, by rollback, or by pinning `--version`)
+  raises `SchemaConflict`;
+- every surviving revision and all subsequent commits behave exactly as
+  before; `versions()` lists the anchor followed by the surviving tail.
+
+Compaction never blocks a read and can run while commits land. The merge
+reads only the files of the merged segment (the surviving tail is never
+re-read, so one compaction round costs strictly less than re-reading the
+whole history), builds the baseline in memory, stages it as a temp
+artifact, and switches only after the staged tree has been checked
+field-for-field against the anchor revision both from memory and again
+after re-reading the staged file. The manifest pointer is replaced
+atomically as the single switch; none of the merged revision files is
+deleted until that replacement has landed. A crash or interruption is
+therefore reconciled the next time the lock is taken into either "the
+compaction fully happened" (manifest points at a complete baseline;
+leftover merged files and stale baselines are removed) or "it never
+happened" (no manifest; every staged baseline and temp file is removed),
+never a half baseline or two baselines at once. While a compaction runs,
+every read still observes one complete version through the old pointer;
+if a commit moves the history under an in-flight compaction it retries on
+the fresh range.
+
+`compact(background=True)` (or `--background`, which detaches a worker
+process) runs the merge without blocking the caller; `compaction_status()`
+(or the `status` command) reports whether it is `running`, its `[first,
+last]` merged `range`, the committed `baseline` anchor and `merged`
+revisions, the live `versions`, and any background `error`. A background
+failure changes no committed revision and is reported there.
+
+Retention never deletes the baseline: the bound applies to numbered
+revision files only, so the baseline plus the newest revisions always
+remain readable. `compact` returns `None` (the command prints
+`{"compacted": false}`) when the history already holds at most `keep`
+versions.
+
 A lens directory that only holds the old single-file format
 (`schema.json`, format version 1 or 2) is still read. The legacy file is
 validated completely and migrated in place into revision 1 the first time
@@ -133,9 +188,11 @@ subtrees by their own path, overflow entries as `$.*` under their object
 node's path. The marker segment `*` is not a quoted key and cannot be a
 real field name, so a field literally named `*` is still reported as
 `$["*"]` and never confused with the overflow marker. When checking
-records, a field name that fell into an overflow entry is validated
-against the overflow entry's widened type set instead of being reported
-as unexpected, and collapsed subtrees are not descended into.
+records, a field name that actually folded into the overflow entry is
+validated against its widened type set instead of being reported as
+unexpected (the folded names are recorded in the entry's `names` list), a
+name never seen before is still an unexpected field, and collapsed
+subtrees are not descended into.
 
 ## Incremental inference
 
