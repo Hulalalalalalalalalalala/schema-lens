@@ -19,6 +19,7 @@ Python 3.11 or newer. Standard library only.
     python3 -m schema_lens --path ./lens rollback <revision>
     python3 -m schema_lens --path ./lens compact [--keep <revisions>] [--background]
     python3 -m schema_lens --path ./lens status
+    python3 -m schema_lens --path ./lens compat <old-revision> <new-revision>
 
 `check` and `show` accept `--version <revision>` to target one specific
 committed revision; without it they use the snapshot loaded at open time.
@@ -34,6 +35,7 @@ committed revision; without it they use the snapshot loaded at open time.
 - `rollback(version) -> int` commits the target revision's schema again as a new revision and returns the new revision number.
 - `compact(*, keep=None, background=False) -> dict | None` merges the oldest history segment into one baseline version and returns `{"anchor": ..., "merged": [...]}` (or `None` when the history is already within the keep bound).
 - `compaction_status() -> dict` reports the committed baseline, the revisions merged into it, the live logical history and any background run in progress.
+- `compat(from_revision, to_revision) -> dict` reads two committed revisions read-only and reports cross-version compatibility.
 - `stats() -> dict` reports fields, optional fields, observed types and observation counts.
 - `SchemaConflict` exported exception.
 
@@ -211,6 +213,50 @@ literally named `a.b` is reported as `$["a.b"]` and can never be confused
 with the nested path `$.a.b`. Backslashes are quoted the same way
 (`$["a\\b"]`), and a field literally named `*` reads as `$["*"]`, distinct
 from the `$.*` overflow marker.
+
+## Cross-version compatibility
+
+`compat(old, new)` reads the two complete committed snapshots and compares
+them recursively - object fields, optionality, type sets and array
+element kinds - without changing memory, the open snapshot or any
+revision. The command prints one JSON report and nothing else:
+
+    python3 -m schema_lens --path ./lens compat 1 2
+
+The report always carries:
+
+- `from` / `to` - the two revision numbers, in the order given;
+- `backward` - whether revision `to`'s `check` accepts every record
+  legal under revision `from`, i.e. can new consumers read old records;
+- `forward` - the mirror direction, whether revision `from`'s `check`
+  accepts records legal under revision `to`;
+- `changes` - every differing field path in stable path order, each with
+  its `change` category and a `breaking` flag for the backward direction;
+- `unknown_reasons` - the locations where approximation on either side
+  makes an exact comparison impossible.
+
+Each verdict is `compatible`, `breaking` or `unknown`. In the evolution
+direction an added optional field, a required field becoming optional, or
+a type/element set widening is non-breaking; a removed field, an optional
+field becoming required, a type/element set narrowing, or a nested branch
+under a retained type that rejects formerly legal values is breaking.
+Object fields and array element kinds follow the same rules, so a newly
+required field inside a retained object kind shows up at the nested path
+(`$.user[*].id`-style element branches render with a `[*]` wildcard,
+distinct from the quoted literal key `$["*"]` and the `$.*` overflow
+marker). An overflow entry, an approximate entry, or a depth-collapsed
+node on either side makes both directions `unknown` and records the path
+and side under `unknown_reasons`; exact comparisons elsewhere in the
+same snapshots still stand.
+
+Comparing a revision with itself always yields `compatible` in both
+directions with an empty change list, and repeating the same pair is
+stable. A missing, compacted-away or corrupt revision (on either side)
+raises `SchemaConflict`; the command exits `2` then and also on wrong
+argument counts, and prints no report. A completed analysis exits `0`
+even when it reports `breaking` or `unknown`. Compatibility only covers
+the JSON shape, field optionality and type sets `schema()` expresses - no
+defaults, enums, migrations or new on-disk formats are introduced.
 
 ## Tests
 

@@ -69,12 +69,18 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "command",
-        choices=["infer", "check", "show", "versions", "rollback", "compact", "status"],
+        choices=["infer", "check", "show", "versions", "rollback", "compact",
+                 "status", "compat"],
     )
     parser.add_argument(
         "target",
         nargs="?",
         help="JSONL records file (infer/check) or revision number (rollback)",
+    )
+    parser.add_argument(
+        "extra_target",
+        nargs="?",
+        help="compat: the newer revision number",
     )
     parser.add_argument(
         "--keep",
@@ -111,6 +117,8 @@ def main(argv: list[str] | None = None) -> int:
         return fail("compact takes no positional argument")
     if args.command == "status" and args.target is not None:
         return fail("status takes no positional argument")
+    if args.extra_target is not None and args.command != "compat":
+        return fail(f"{args.command} takes one positional argument at most")
     rollback_revision: int | None = None
     if args.command == "rollback":
         if args.target is None:
@@ -119,6 +127,14 @@ def main(argv: list[str] | None = None) -> int:
             rollback_revision = int(args.target)
         except ValueError:
             return fail("rollback revision must be an integer")
+    compat_revisions: tuple[int, int] | None = None
+    if args.command == "compat":
+        if args.target is None or args.extra_target is None:
+            return fail("compat requires exactly two revision numbers")
+        try:
+            compat_revisions = (int(args.target), int(args.extra_target))
+        except ValueError:
+            return fail("compat revisions must be integers")
 
     lens_kwargs = {}
     if args.max_versions is not None:
@@ -160,6 +176,15 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "versions":
             json.dump(lens.versions(), sys.stdout)
+            sys.stdout.write("\n")
+            return 0
+        if args.command == "compat":
+            # Read-only: both snapshots are validated from disk and the
+            # report is the only output. Breaking or unknown still
+            # completes successfully; missing/corrupt revisions fall
+            # through to the SchemaConflict handler with exit code 2.
+            report = lens.compat(*compat_revisions)
+            json.dump(report, sys.stdout, indent=2, sort_keys=True)
             sys.stdout.write("\n")
             return 0
         if args.command == "status":

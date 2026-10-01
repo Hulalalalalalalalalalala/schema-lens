@@ -6,7 +6,7 @@ import sys
 import tempfile
 import threading
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 from schema_lens import Lens, SchemaConflict
@@ -2136,6 +2136,554 @@ class CompactionCliTests(unittest.TestCase):
             _time.sleep(0.05)
         self.assertEqual(status["baseline"], 3)
         self.assertFalse(status["running"])
+
+
+class CompatTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+
+    def _snapshot(self, records, **kwargs):
+        lens = Lens(tempfile.mkdtemp(), **kwargs)
+        lens.infer(records)
+        return lens.schema()
+
+    def _commit(self, revision, root):
+        from schema_lens.core import _encode_revision
+
+        versions_dir = Path(self.dir.name, VERSIONS_DIRNAME)
+        versions_dir.mkdir(parents=True, exist_ok=True)
+        (versions_dir / f"revision-{revision:010d}.json").write_text(
+            _encode_revision(revision, root), encoding="utf-8"
+        )
+
+    def _pair(self, old_records, new_records, **old_kwargs):
+        old_root = self._snapshot(old_records, **old_kwargs)
+        new_root = self._snapshot(new_records)
+        self._commit(1, old_root)
+        self._commit(2, new_root)
+        return Lens(self.dir.name).compat(1, 2)
+
+    def test_self_comparison_is_compatible_with_empty_changes(self):
+        root = self._snapshot([{"a": 1, "b": {"c": "x"}}, {"a": 2}])
+        self._commit(1, root)
+        report = Lens(self.dir.name).compat(1, 1)
+        self.assertEqual(
+            report,
+            {
+                "from": 1,
+                "to": 1,
+                "backward": "compatible",
+                "forward": "compatible",
+                "changes": [],
+                "unknown_reasons": [],
+            },
+        )
+
+    def test_report_always_carries_the_six_fixed_keys(self):
+        root = self._snapshot([{"a": 1}])
+        self._commit(1, root)
+        report = Lens(self.dir.name).compat(1, 1)
+        self.assertEqual(
+            sorted(report),
+            ["backward", "changes", "forward", "from", "to", "unknown_reasons"],
+        )
+
+    def test_added_optional_field_is_backward_compatible_forward_breaking(self):
+        report = self._pair(
+            [{"a": 1}, {"a": 2}],
+            [{"a": 3, "b": "x"}, {"a": 4}],
+        )
+        self.assertEqual(report["backward"], "compatible")
+        self.assertEqual(report["forward"], "breaking")
+        self.assertEqual(
+            report["changes"],
+            [{"path": "$.b", "change": "field-added", "breaking": False}],
+        )
+        self.assertEqual(report["unknown_reasons"], [])
+
+    def test_added_required_field_breaks_both_directions(self):
+        report = self._pair(
+            [{"a": 1}, {"a": 2}],
+            [{"a": 3, "b": "x"}, {"a": 4, "b": "y"}],
+        )
+        self.assertEqual(report["backward"], "breaking")
+        self.assertEqual(report["forward"], "breaking")
+        self.assertEqual(
+            report["changes"],
+            [{"path": "$.b", "change": "field-added", "breaking": True}],
+        )
+
+    def test_removed_optional_field_breaks_backward_only(self):
+        report = self._pair(
+            [{"a": 1, "b": "x"}, {"a": 2}],
+            [{"a": 3}, {"a": 4}],
+        )
+        self.assertEqual(report["backward"], "breaking")
+        self.assertEqual(report["forward"], "compatible")
+        self.assertEqual(
+            report["changes"],
+            [{"path": "$.b", "change": "field-removed", "breaking": True}],
+        )
+
+    def test_removed_required_field_breaks_both_directions(self):
+        report = self._pair(
+            [{"a": 1, "b": "x"}, {"a": 2, "b": "y"}],
+            [{"a": 3}, {"a": 4}],
+        )
+        self.assertEqual(report["backward"], "breaking")
+        self.assertEqual(report["forward"], "breaking")
+        self.assertEqual(
+            report["changes"],
+            [{"path": "$.b", "change": "field-removed", "breaking": True}],
+        )
+
+    def test_required_becoming_optional(self):
+        report = self._pair(
+            [{"a": 1, "b": "x"}, {"a": 2, "b": "y"}],
+            [{"a": 3, "b": "x"}, {"a": 4}],
+        )
+        self.assertEqual(report["backward"], "compatible")
+        self.assertEqual(report["forward"], "breaking")
+        self.assertEqual(
+            report["changes"],
+            [{"path": "$.b", "change": "made-optional", "breaking": False}],
+        )
+
+    def test_optional_becoming_required(self):
+        report = self._pair(
+            [{"a": 1, "b": "x"}, {"a": 2}],
+            [{"a": 3, "b": "x"}, {"a": 4, "b": "y"}],
+        )
+        self.assertEqual(report["backward"], "breaking")
+        self.assertEqual(report["forward"], "compatible")
+        self.assertEqual(
+            report["changes"],
+            [{"path": "$.b", "change": "made-required", "breaking": True}],
+        )
+
+    def test_type_set_widening_is_backward_compatible(self):
+        report = self._pair(
+            [{"a": 1}, {"a": 2}],
+            [{"a": 3}, {"a": "x"}],
+        )
+        self.assertEqual(report["backward"], "compatible")
+        self.assertEqual(report["forward"], "breaking")
+        self.assertEqual(
+            report["changes"],
+            [{"path": "$.a", "change": "types-widened", "breaking": False}],
+        )
+
+    def test_type_set_narrowing_breaks_backward(self):
+        report = self._pair(
+            [{"a": 1}, {"a": "x"}],
+            [{"a": 3}, {"a": 4}],
+        )
+        self.assertEqual(report["backward"], "breaking")
+        self.assertEqual(report["forward"], "compatible")
+        self.assertEqual(
+            report["changes"],
+            [{"path": "$.a", "change": "types-narrowed", "breaking": True}],
+        )
+
+    def test_type_replacement_breaks_both_directions(self):
+        report = self._pair(
+            [{"a": 1}, {"a": 2}],
+            [{"a": "x"}, {"a": "y"}],
+        )
+        self.assertEqual(report["backward"], "breaking")
+        self.assertEqual(report["forward"], "breaking")
+        self.assertEqual(
+            report["changes"],
+            [{"path": "$.a", "change": "types-changed", "breaking": True}],
+        )
+
+    def test_nested_required_field_inside_retained_object_branch(self):
+        report = self._pair(
+            [{"user": {"name": "ann"}}, {"user": {"name": "bob"}}],
+            [
+                {"user": {"name": "ann", "id": 1}},
+                {"user": {"name": "bob", "id": 2}},
+            ],
+        )
+        self.assertEqual(report["backward"], "breaking")
+        self.assertEqual(report["forward"], "breaking")
+        self.assertEqual(
+            report["changes"],
+            [{"path": "$.user.id", "change": "field-added", "breaking": True}],
+        )
+
+    def test_array_element_set_widening_uses_wildcard_branch_path(self):
+        report = self._pair(
+            [{"tags": ["a"]}, {"tags": ["b"]}],
+            [{"tags": ["a", 1]}, {"tags": []}],
+        )
+        self.assertEqual(report["backward"], "compatible")
+        self.assertEqual(report["forward"], "breaking")
+        self.assertEqual(
+            report["changes"],
+            [{"path": "$.tags[*]", "change": "types-widened", "breaking": False}],
+        )
+
+    def test_array_element_set_narrowing_breaks_backward(self):
+        report = self._pair(
+            [{"items": [1, "x"]}, {"items": [2]}],
+            [{"items": [3]}, {"items": [4]}],
+        )
+        self.assertEqual(report["backward"], "breaking")
+        self.assertEqual(report["forward"], "compatible")
+        self.assertEqual(
+            report["changes"],
+            [{"path": "$.items[*]", "change": "types-narrowed",
+              "breaking": True}],
+        )
+
+    def test_array_element_object_field_change_uses_wildcard_then_path(self):
+        report = self._pair(
+            [{"items": [{"x": 1}, {"x": 2}]}, {"items": []}],
+            [{"items": [{"x": 1, "y": "s"}]}, {"items": [{"x": 2, "y": "t"}]}],
+        )
+        self.assertEqual(report["backward"], "breaking")
+        self.assertEqual(
+            report["changes"],
+            [{"path": "$.items[*].y", "change": "field-added",
+              "breaking": True}],
+        )
+
+    def test_changes_are_listed_in_stable_path_order(self):
+        report = self._pair(
+            [{"a": 1}, {"a": 2}],
+            [{"a": "x", "b": 1, "c": 2}, {"a": "y", "b": 1, "c": 2}],
+        )
+        paths = [change["path"] for change in report["changes"]]
+        self.assertEqual(paths, sorted(paths))
+        self.assertEqual(paths, ["$.a", "$.b", "$.c"])
+
+    def test_dotted_key_path_stays_quoted_in_changes(self):
+        report = self._pair(
+            [{"a.b": 1}, {"a.b": 2}],
+            [{"a.b": 3}, {"a.b": 4}],
+        )
+        self.assertEqual(report["changes"], [])
+        report = self._pair(
+            [{"a.b": 1}, {"a.b": 2}],
+            [{"a.b": 3}, {"a.b": "x"}],
+        )
+        self.assertEqual(
+            [c["path"] for c in report["changes"]], ['$["a.b"]']
+        )
+
+    def test_literal_star_key_is_distinct_from_element_branch(self):
+        report = self._pair(
+            [{"*": 1}, {"*": 2}],
+            [{"*": "x"}, {"*": "y"}],
+        )
+        # The real key quotes; it must never render as a wildcard branch.
+        self.assertEqual(
+            report["changes"],
+            [{"path": '$["*"]', "change": "types-changed", "breaking": True}],
+        )
+
+    def test_repeated_analysis_is_stable(self):
+        report = self._pair(
+            [{"a": 1}, {"a": "x"}],
+            [{"a": 3, "b": 1}, {"a": 4}],
+        )
+        lens = Lens(self.dir.name)
+        self.assertEqual(lens.compat(1, 2), report)
+        self.assertEqual(lens.compat(1, 2), report)
+
+    def test_reversed_pair_swaps_the_direction_verdicts(self):
+        root_old = self._snapshot([{"a": 1}, {"a": 2}])
+        root_new = self._snapshot([{"a": 3}, {"a": "x"}])
+        self._commit(1, root_old)
+        self._commit(2, root_new)
+        lens = Lens(self.dir.name)
+        forward_pair = lens.compat(1, 2)
+        reversed_pair = lens.compat(2, 1)
+        self.assertEqual(forward_pair["backward"], "compatible")
+        self.assertEqual(forward_pair["forward"], "breaking")
+        self.assertEqual(reversed_pair["backward"], "breaking")
+        self.assertEqual(reversed_pair["forward"], "compatible")
+
+    def test_overflow_on_new_side_makes_both_directions_unknown(self):
+        old_root = self._snapshot([{"a": 1, "b": 2}])
+        new_root = self._snapshot(
+            [{"a": 1, "b": 2, "c": 3, "d": 4}], max_fields=1
+        )
+        self._commit(1, old_root)
+        self._commit(2, new_root)
+        report = Lens(self.dir.name).compat(1, 2)
+        self.assertEqual(report["backward"], "unknown")
+        self.assertEqual(report["forward"], "unknown")
+        self.assertIn(
+            {"path": "$.*", "side": "to", "reason": "overflow"},
+            report["unknown_reasons"],
+        )
+
+    def test_overflow_on_old_side_is_reported_with_its_side(self):
+        old_root = self._snapshot([{"a": 1, "b": 2, "c": 3}], max_fields=1)
+        new_root = self._snapshot([{"a": 1}, {"a": 2}])
+        self._commit(1, old_root)
+        self._commit(2, new_root)
+        report = Lens(self.dir.name).compat(1, 2)
+        self.assertEqual(report["backward"], "unknown")
+        self.assertEqual(report["forward"], "unknown")
+        self.assertIn(
+            {"path": "$.*", "side": "from", "reason": "overflow"},
+            report["unknown_reasons"],
+        )
+
+    def test_folded_name_is_not_reported_as_added_or_removed(self):
+        # b really folded into the old overflow entry, so it must not be
+        # called a fresh field-added (which would claim forward breakage);
+        # the overflow reason already makes the branch unknown.
+        old_root = self._snapshot([{"a": 1, "b": 2, "c": 3}], max_fields=1)
+        new_root = self._snapshot([{"a": 1, "b": 2}, {"a": 2, "b": 3}])
+        self._commit(1, old_root)
+        self._commit(2, new_root)
+        report = Lens(self.dir.name).compat(1, 2)
+        paths = [change["path"] for change in report["changes"]]
+        self.assertNotIn("$.b", paths)
+        self.assertNotIn("$.c", paths)
+        self.assertEqual(
+            [r["path"] for r in report["unknown_reasons"]], ["$.*"]
+        )
+
+    def test_overflow_unknown_provenance_keeps_the_branch_unknown(self):
+        # A legacy overflow entry without a names list accepts any name.
+        old_root = self._snapshot([{"a": 1, "b": 2}], max_fields=1)
+        old_root["overflow"]["names"] = None
+        new_root = self._snapshot([{"a": 1}, {"a": 2, "z": 9}])
+        self._commit(1, old_root)
+        self._commit(2, new_root)
+        report = Lens(self.dir.name).compat(1, 2)
+        self.assertEqual(report["backward"], "unknown")
+        self.assertEqual(report["forward"], "unknown")
+        self.assertNotIn("$.z", [c["path"] for c in report["changes"]])
+
+    def test_depth_collapsed_node_makes_both_directions_unknown(self):
+        old_root = self._snapshot(
+            [{"user": {"name": "ann"}}, {"user": {"name": "bob"}}]
+        )
+        new_root = self._snapshot(
+            [{"user": {"name": "ann", "id": 1}}], max_depth=0
+        )
+        self._commit(1, old_root)
+        self._commit(2, new_root)
+        report = Lens(self.dir.name).compat(1, 2)
+        self.assertEqual(report["backward"], "unknown")
+        self.assertEqual(report["forward"], "unknown")
+        self.assertIn(
+            {"path": "$.user", "side": "to", "reason": "approximate"},
+            report["unknown_reasons"],
+        )
+
+    def test_exact_changes_elsewhere_survive_an_unknown_branch(self):
+        old_root = self._snapshot(
+            [
+                {"a": 1, "user": {"x": {"y": 1}}},
+                {"a": 2, "user": {"x": {"y": 2}}},
+            ]
+        )
+        new_root = self._snapshot(
+            [{"a": "s", "user": {"x": {"y": 3}}}], max_depth=1
+        )
+        self._commit(1, old_root)
+        self._commit(2, new_root)
+        report = Lens(self.dir.name).compat(1, 2)
+        self.assertEqual(report["backward"], "unknown")
+        self.assertEqual(report["forward"], "unknown")
+        # The exact type change at $.a is still listed.
+        self.assertIn("$.a", [c["path"] for c in report["changes"]])
+        self.assertTrue(
+            any(r["path"] == "$.user.x" for r in report["unknown_reasons"])
+        )
+
+    def test_missing_revision_raises_schema_conflict(self):
+        root = self._snapshot([{"a": 1}])
+        self._commit(1, root)
+        lens = Lens(self.dir.name)
+        with self.assertRaises(SchemaConflict):
+            lens.compat(1, 2)
+        with self.assertRaises(SchemaConflict):
+            lens.compat(2, 1)
+
+    def test_corrupt_revision_raises_schema_conflict(self):
+        root = self._snapshot([{"a": 1}])
+        self._commit(1, root)
+        self._commit(2, root)
+        revision_path(self.dir.name, 2).write_text("{broken", encoding="utf-8")
+        with self.assertRaises(SchemaConflict):
+            Lens(self.dir.name).compat(1, 2)
+
+    def test_compacted_away_revision_raises_schema_conflict(self):
+        lens = Lens(self.dir.name, max_versions=2, compact_keep=1)
+        for index in range(4):
+            lens.infer([{f"f{index}": index}])
+            lens.save()
+        lens.compact()
+        with self.assertRaises(SchemaConflict):
+            lens.compat(1, lens.versions()[-1])
+
+    def test_invalid_revision_arguments_raise_schema_conflict(self):
+        root = self._snapshot([{"a": 1}])
+        self._commit(1, root)
+        lens = Lens(self.dir.name)
+        for bad in (0, -1, 1.5, True, "1"):
+            with self.assertRaises(SchemaConflict):
+                lens.compat(bad, 1)
+            with self.assertRaises(SchemaConflict):
+                lens.compat(1, bad)
+
+    def test_compat_does_not_change_state_or_open_snapshot(self):
+        lens = Lens(self.dir.name)
+        lens.infer([{"a": 1}])
+        lens.save()
+        lens.infer([{"b": 2}])
+        lens.save()
+        reader = Lens(self.dir.name)
+        reader.load()
+        before = reader.schema()
+        reader.compat(1, 2)
+        reader.compat(2, 1)
+        self.assertEqual(reader.schema(), before)
+        self.assertEqual(reader.versions(), [1, 2])
+        self.assertEqual(
+            set(reader.schema(version=1)["fields"]), {"a"}
+        )
+
+
+class CompatCliTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.lens_dir = str(Path(self.dir.name, "lens"))
+        self.records = str(Path(self.dir.name, "records.jsonl"))
+
+    def _commit(self, records):
+        with open(self.records, "w", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(json.dumps(record) + "\n")
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = cli_main(
+                ["--path", self.lens_dir, "infer", self.records]
+            )
+        self.assertEqual(code, 0)
+
+    def _run(self, *argv):
+        out = io.StringIO()
+        err = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = cli_main(list(argv))
+        return code, out.getvalue(), err.getvalue()
+
+    def test_compat_command_prints_json_report(self):
+        self._commit([{"a": 1}])
+        self._commit([{"a": 2, "b": "x"}])
+        code, out, err = self._run(
+            "--path", self.lens_dir, "compat", "1", "2"
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+        report = json.loads(out)
+        self.assertEqual(report["from"], 1)
+        self.assertEqual(report["to"], 2)
+        self.assertEqual(report["backward"], "compatible")
+        self.assertEqual(report["forward"], "breaking")
+        self.assertEqual(
+            report["changes"],
+            [{"path": "$.b", "change": "field-added", "breaking": False}],
+        )
+        self.assertEqual(report["unknown_reasons"], [])
+
+    def test_breaking_report_still_exits_zero(self):
+        # Append-only commits only widen; a rollback expresses a narrower
+        # schema as a new revision, so 2 -> 3 genuinely narrows and removes.
+        self._commit([{"a": 1}])
+        self._commit([{"a": "x", "b": "y"}])
+        code, _, _ = self._run(
+            "--path", self.lens_dir, "rollback", "1"
+        )
+        self.assertEqual(code, 0)
+        code, out, _ = self._run(
+            "--path", self.lens_dir, "compat", "2", "3"
+        )
+        self.assertEqual(code, 0)
+        report = json.loads(out)
+        self.assertEqual(report["backward"], "breaking")
+        paths = [change["path"] for change in report["changes"]]
+        self.assertIn("$.a", paths)
+        self.assertIn("$.b", paths)
+
+    def test_self_comparison_via_cli(self):
+        self._commit([{"a": 1}])
+        code, out, _ = self._run(
+            "--path", self.lens_dir, "compat", "1", "1"
+        )
+        self.assertEqual(code, 0)
+        report = json.loads(out)
+        self.assertEqual(report["backward"], "compatible")
+        self.assertEqual(report["forward"], "compatible")
+        self.assertEqual(report["changes"], [])
+
+    def test_missing_revision_exits_two_without_report(self):
+        self._commit([{"a": 1}])
+        code, out, err = self._run(
+            "--path", self.lens_dir, "compat", "1", "2"
+        )
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+        self.assertIn("schema_lens:", err)
+
+    def test_wrong_argument_counts_exit_two_without_report(self):
+        self._commit([{"a": 1}])
+        for argv in (
+            ("compat",),
+            ("compat", "1"),
+        ):
+            code, out, _ = self._run("--path", self.lens_dir, *argv)
+            self.assertEqual(code, 2)
+            self.assertEqual(out, "")
+        # Three positionals are an argparse usage error.
+        code, out, _ = self._run(
+            "--path", self.lens_dir, "compat", "1", "2", "3"
+        )
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+
+    def test_non_integer_revision_exits_two_without_report(self):
+        self._commit([{"a": 1}])
+        code, out, _ = self._run(
+            "--path", self.lens_dir, "compat", "one", "1"
+        )
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+
+    def test_version_flag_not_valid_with_compat(self):
+        self._commit([{"a": 1}])
+        code, _, _ = self._run(
+            "--path", self.lens_dir, "--version", "1", "compat", "1", "1"
+        )
+        self.assertEqual(code, 2)
+
+    def test_compat_does_not_publish_or_move_any_revision(self):
+        self._commit([{"a": 1}])
+        self._commit([{"a": 2}])
+        before = {
+            name: (Path(self.lens_dir, VERSIONS_DIRNAME) / name).read_bytes()
+            for name in os.listdir(Path(self.lens_dir, VERSIONS_DIRNAME))
+        }
+        code, _, _ = self._run(
+            "--path", self.lens_dir, "compat", "1", "2"
+        )
+        self.assertEqual(code, 0)
+        after = {
+            name: (Path(self.lens_dir, VERSIONS_DIRNAME) / name).read_bytes()
+            for name in os.listdir(Path(self.lens_dir, VERSIONS_DIRNAME))
+        }
+        self.assertEqual(before, after)
 
 
 if __name__ == "__main__":
