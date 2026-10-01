@@ -2682,6 +2682,290 @@ class CompatCliTests(unittest.TestCase):
         self.assertEqual(code, 2)
 
 
+class CompatMatrixTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.lens = Lens(self.dir.name)
+
+    def _publish(self, revision, records, **limits):
+        return _publish(self.dir.name, records, revision, **limits)
+
+    def _publish_three(self):
+        self._publish(1, [{"a": 1}, {"a": 2}])
+        self._publish(2, [{"a": 3, "b": "x"}, {"a": 4}])
+        self._publish(3, [{"a": 5, "c": True}])
+
+    def test_shape_covers_every_ordered_pair_including_self(self):
+        self._publish_three()
+        matrix = self.lens.compat_matrix()
+        self.assertEqual(set(matrix), {"revisions", "pairs"})
+        self.assertEqual(matrix["revisions"], [1, 2, 3])
+        self.assertEqual(
+            [(p["from"], p["to"]) for p in matrix["pairs"]],
+            [(1, 1), (1, 2), (1, 3), (2, 1), (2, 2), (2, 3),
+             (3, 1), (3, 2), (3, 3)],
+        )
+        for pair in matrix["pairs"]:
+            self.assertEqual(
+                set(pair),
+                {"from", "to", "backward", "forward", "changes",
+                 "unknown_reasons"},
+            )
+            self.assertIn(pair["backward"],
+                          ("compatible", "breaking", "unknown"))
+            self.assertIn(pair["forward"],
+                          ("compatible", "breaking", "unknown"))
+
+    def test_each_pair_matches_single_compat_report(self):
+        self._publish_three()
+        matrix = self.lens.compat_matrix()
+        for pair in matrix["pairs"]:
+            self.assertEqual(
+                pair, self.lens.compat(pair["from"], pair["to"])
+            )
+
+    def test_self_pairs_are_compatible_with_approximate_revision(self):
+        # max_fields=1 forces an overflow entry on every revision; the
+        # self-comparison must still be compatible with empty reasons.
+        self._publish(1, [{"a": 1, "b": 2}, {"a": 3, "c": 4}], max_fields=1)
+        matrix = self.lens.compat_matrix()
+        (self_pair,) = matrix["pairs"]
+        self.assertEqual(
+            self_pair,
+            {"from": 1, "to": 1, "backward": "compatible",
+             "forward": "compatible", "changes": [],
+             "unknown_reasons": []},
+        )
+
+    def test_unknown_pairs_keep_reasons_and_others_stay_settled(self):
+        self._publish(1, [{"a": 1, "b": 2}], max_fields=1)
+        self._publish(2, [{"a": 3}], max_fields=1)
+        self._publish(3, [{"a": 4}])
+        matrix = self.lens.compat_matrix()
+        by_pair = {(p["from"], p["to"]): p for p in matrix["pairs"]}
+        for from_rev, to_rev in ((1, 2), (2, 1), (1, 3), (3, 1)):
+            pair = by_pair[(from_rev, to_rev)]
+            self.assertEqual(pair["backward"], "unknown")
+            self.assertEqual(pair["forward"], "unknown")
+            self.assertEqual(pair["unknown_reasons"], ["$.*"])
+        # The exact pair between the two exact revisions is untouched.
+        self.assertEqual(
+            (by_pair[(2, 3)]["backward"], by_pair[(2, 3)]["forward"]),
+            ("compatible", "compatible"),
+        )
+
+    def test_explicit_revisions_are_the_analysis_order(self):
+        self._publish_three()
+        matrix = self.lens.compat_matrix([1, 3])
+        self.assertEqual(matrix["revisions"], [1, 3])
+        self.assertEqual(
+            [(p["from"], p["to"]) for p in matrix["pairs"]],
+            [(1, 1), (1, 3), (3, 1), (3, 3)],
+        )
+
+    def test_repeated_calls_are_identical_in_content_and_order(self):
+        self._publish_three()
+        first = self.lens.compat_matrix()
+        for _ in range(3):
+            self.assertEqual(self.lens.compat_matrix(), first)
+
+    def test_default_uses_all_committed_revisions_including_anchor(self):
+        self._publish_three()
+        # Compact revisions 1 and 2 into anchor 2; the logical history is
+        # the anchor followed by the surviving tail.
+        self.lens.compact(keep=1)
+        self.assertEqual(self.lens.versions(), [2, 3])
+        matrix = self.lens.compat_matrix()
+        self.assertEqual(matrix["revisions"], [2, 3])
+
+    def test_does_not_change_memory_or_committed_state(self):
+        self._publish_three()
+        before = sorted(
+            p.name for p in (Path(self.dir.name) / VERSIONS_DIRNAME).iterdir()
+        )
+        self.lens.compat_matrix()
+        self.lens.compat_matrix([1, 2])
+        after = sorted(
+            p.name for p in (Path(self.dir.name) / VERSIONS_DIRNAME).iterdir()
+        )
+        self.assertEqual(before, after)
+        # No open snapshot was adopted by reading.
+        with self.assertRaises(SchemaConflict):
+            self.lens.stats()
+
+    def test_empty_history_without_revisions_raises_conflict(self):
+        with self.assertRaises(SchemaConflict):
+            self.lens.compat_matrix()
+
+    def test_invalid_revision_sequences_raise_value_error(self):
+        self._publish_three()
+        bad_sequences = [
+            [],
+            [0],
+            [-1],
+            [True],
+            [1, 1],
+            [2, 1],
+            [1, 3, 2],
+            [1.0, 2],
+            ["1", "2"],
+            {1, 2},
+            1,
+        ]
+        for sequence in bad_sequences:
+            with self.subTest(sequence=sequence):
+                with self.assertRaises(ValueError):
+                    self.lens.compat_matrix(sequence)
+        # A tuple is an accepted ordered sequence.
+        self.assertEqual(
+            self.lens.compat_matrix((1, 2))["revisions"], [1, 2]
+        )
+
+    def test_missing_revision_raises_conflict(self):
+        self._publish_three()
+        with self.assertRaises(SchemaConflict):
+            self.lens.compat_matrix([1, 9])
+
+    def test_pruned_revision_raises_conflict(self):
+        self._publish_three()
+        lens = Lens(self.dir.name, max_versions=2)
+        lens.infer([{"z": 1}])
+        lens.save()
+        # Revisions 1 and 2 are pruned; the explicit request must fail.
+        with self.assertRaises(SchemaConflict):
+            self.lens.compat_matrix([1, 3])
+
+    def test_compacted_away_revision_raises_conflict(self):
+        self._publish_three()
+        self.lens.compact(keep=1)
+        # Revision 1 was folded into anchor 2 and is no longer readable.
+        with self.assertRaises(SchemaConflict):
+            self.lens.compat_matrix([1, 2, 3])
+
+    def test_corrupt_revision_raises_conflict(self):
+        self._publish_three()
+        (Path(self.dir.name, VERSIONS_DIRNAME,
+              "revision-0000000002.json")).write_text("{broken", encoding="utf-8")
+        with self.assertRaises(SchemaConflict):
+            self.lens.compat_matrix()
+
+
+class CompatMatrixCliTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.lens_dir = str(Path(self.dir.name, "lens"))
+        self.records = str(Path(self.dir.name, "records.jsonl"))
+
+    def _write(self, records):
+        with open(self.records, "w", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(json.dumps(record) + "\n")
+
+    def _run(self, *argv):
+        out = io.StringIO()
+        err = io.StringIO()
+        with redirect_stdout(out):
+            code = cli_main(list(argv))
+        return code, out.getvalue()
+
+    def _commit(self, records):
+        self._write(records)
+        code, _ = self._run("--path", self.lens_dir, "infer", self.records)
+        self.assertEqual(code, 0)
+
+    def test_matrix_over_all_revisions_outputs_json(self):
+        self._commit([{"a": 1}])
+        self._commit([{"a": 2, "b": "x"}])
+        code, out = self._run("--path", self.lens_dir, "matrix")
+        self.assertEqual(code, 0)
+        matrix = json.loads(out)
+        self.assertEqual(matrix["revisions"], [1, 2])
+        self.assertEqual(
+            [(p["from"], p["to"]) for p in matrix["pairs"]],
+            [(1, 1), (1, 2), (2, 1), (2, 2)],
+        )
+        cross = {p["to"]: p for p in matrix["pairs"] if p["from"] == 1}
+        self.assertEqual(cross[2]["backward"], "compatible")
+        self.assertEqual(cross[2]["forward"], "breaking")
+
+    def test_matrix_with_revisions_subset(self):
+        for records in ([{"a": 1}], [{"a": 2}], [{"a": 3}]):
+            self._commit(records)
+        code, out = self._run(
+            "--path", self.lens_dir, "matrix", "--revisions", "1,3"
+        )
+        self.assertEqual(code, 0)
+        matrix = json.loads(out)
+        self.assertEqual(matrix["revisions"], [1, 3])
+        self.assertEqual(
+            [(p["from"], p["to"]) for p in matrix["pairs"]],
+            [(1, 1), (1, 3), (3, 1), (3, 3)],
+        )
+
+    def test_matrix_is_deterministic(self):
+        for records in ([{"a": 1}], [{"a": 2, "b": "x"}]):
+            self._commit(records)
+        _, first = self._run("--path", self.lens_dir, "matrix")
+        _, second = self._run("--path", self.lens_dir, "matrix")
+        self.assertEqual(first, second)
+
+    def test_matrix_empty_history_exits_two_no_report(self):
+        code, out = self._run("--path", self.lens_dir, "matrix")
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+
+    def test_matrix_invalid_revisions_exits_two_no_report(self):
+        self._commit([{"a": 1}])
+        for spec in ("", "0", "-1", "1,1", "2,1", "true", "1,", "abc",
+                     "1,2,2"):
+            with self.subTest(spec=spec):
+                code, out = self._run(
+                    "--path", self.lens_dir, "matrix", "--revisions", spec
+                )
+                self.assertEqual(code, 2)
+                self.assertEqual(out, "")
+
+    def test_matrix_missing_revision_exits_two_no_report(self):
+        self._commit([{"a": 1}])
+        code, out = self._run(
+            "--path", self.lens_dir, "matrix", "--revisions", "1,9"
+        )
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+
+    def test_matrix_corrupt_revision_exits_two_no_report(self):
+        self._commit([{"a": 1}])
+        self._commit([{"a": 2}])
+        (Path(self.lens_dir, VERSIONS_DIRNAME,
+              "revision-0000000002.json")).write_text("{broken", encoding="utf-8")
+        code, out = self._run("--path", self.lens_dir, "matrix")
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+
+    def test_matrix_does_not_change_versions(self):
+        self._commit([{"a": 1}])
+        self._commit([{"a": 2}])
+        self._run("--path", self.lens_dir, "matrix")
+        code, out = self._run("--path", self.lens_dir, "versions")
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out), [1, 2])
+
+    def test_matrix_rejects_positional_arguments(self):
+        self._commit([{"a": 1}])
+        code, out = self._run("--path", self.lens_dir, "matrix", "1")
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+
+    def test_revisions_flag_rejected_for_other_commands(self):
+        self._commit([{"a": 1}])
+        code, _ = self._run(
+            "--path", self.lens_dir, "versions", "--revisions", "1"
+        )
+        self.assertEqual(code, 2)
+
+
 if __name__ == "__main__":
     unittest.main()
 

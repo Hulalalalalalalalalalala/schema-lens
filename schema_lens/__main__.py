@@ -70,7 +70,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "command",
         choices=["infer", "check", "show", "versions", "rollback", "compact",
-                 "status", "compat"],
+                 "status", "compat", "matrix"],
     )
     parser.add_argument(
         "target",
@@ -88,6 +88,13 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         default=None,
         help="compact: keep at least this many newest revisions out of the baseline",
+    )
+    parser.add_argument(
+        "--revisions",
+        type=str,
+        default=None,
+        help="matrix: comma-separated ascending revision numbers "
+             "(default: every committed revision)",
     )
     parser.add_argument(
         "--background",
@@ -114,10 +121,14 @@ def main(argv: list[str] | None = None) -> int:
         return fail("--keep is only valid with compact")
     if args.background and args.command != "compact":
         return fail("--background is only valid with compact")
+    if args.revisions is not None and args.command != "matrix":
+        return fail("--revisions is only valid with matrix")
     if args.command == "compact" and args.target is not None:
         return fail("compact takes no positional argument")
     if args.command == "status" and args.target is not None:
         return fail("status takes no positional argument")
+    if args.command == "matrix" and args.target is not None:
+        return fail("matrix takes no positional argument")
     if args.command == "compat":
         if args.target is None or args.target2 is None:
             return fail("compat requires two revision numbers: <old> <new>")
@@ -129,6 +140,14 @@ def main(argv: list[str] | None = None) -> int:
     else:
         if args.target2 is not None:
             return fail("only compat takes two positional arguments")
+    matrix_revisions: list[int] | None = None
+    if args.command == "matrix" and args.revisions is not None:
+        try:
+            matrix_revisions = [
+                int(part) for part in args.revisions.split(",")
+            ]
+        except ValueError:
+            return fail("matrix revisions must be integers")
     rollback_revision: int | None = None
     if args.command == "rollback":
         if args.target is None:
@@ -182,6 +201,11 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "compat":
             report = lens.compat(compat_old, compat_new)
+            json.dump(report, sys.stdout, indent=2, sort_keys=True)
+            sys.stdout.write("\n")
+            return 0
+        if args.command == "matrix":
+            report = lens.compat_matrix(matrix_revisions)
             json.dump(report, sys.stdout, indent=2, sort_keys=True)
             sys.stdout.write("\n")
             return 0

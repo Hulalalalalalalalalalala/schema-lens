@@ -20,6 +20,7 @@ Python 3.11 or newer. Standard library only.
     python3 -m schema_lens --path ./lens compact [--keep <revisions>] [--background]
     python3 -m schema_lens --path ./lens status
     python3 -m schema_lens --path ./lens compat <old-revision> <new-revision>
+    python3 -m schema_lens --path ./lens matrix [--revisions 1,2,3]
 
 `check` and `show` accept `--version <revision>` to target one specific
 committed revision; without it they use the snapshot loaded at open time.
@@ -36,6 +37,7 @@ committed revision; without it they use the snapshot loaded at open time.
 - `compact(*, keep=None, background=False) -> dict | None` merges the oldest history segment into one baseline version and returns `{"anchor": ..., "merged": [...]}` (or `None` when the history is already within the keep bound).
 - `compaction_status() -> dict` reports the committed baseline, the revisions merged into it, the live logical history and any background run in progress.
 - `compat(old_revision, new_revision) -> dict` reads two committed snapshots and reports how the evolution between them affects records legal under each side, without changing memory or any revision.
+- `compat_matrix(revisions=None) -> dict` reports `compat` for every ordered pair across several revisions (all of them, ascending, by default), including each self-comparison, without changing memory or any revision.
 - `stats() -> dict` reports fields, optional fields, observed types and observation counts.
 - `SchemaConflict` exported exception.
 
@@ -279,6 +281,49 @@ A missing, pruned/compacted-away or corrupt revision raises
 fewer or more than two revision numbers is an argument error (`2`, no
 report). A completed analysis exits `0` even when a verdict is `breaking`
 or `unknown`.
+
+## Cross-version compatibility matrix
+
+`compat_matrix(revisions=None)` (command: `matrix [--revisions 1,2,3]`)
+collects the pairwise compatibility verdict over several revisions at
+once, for judging upgrade and rollback risk across the whole history. It
+reads the same committed, fully validated snapshots `compat` does and
+never infers, saves, rolls back, compacts or changes the open snapshot:
+
+```json
+{
+  "revisions": [1, 2, 3],
+  "pairs": [
+    {"from": 1, "to": 1, "backward": "compatible", "forward": "compatible", "changes": [], "unknown_reasons": []},
+    {"from": 1, "to": 2, "backward": "compatible", "forward": "breaking", "changes": [...], "unknown_reasons": []},
+    {"from": 2, "to": 1, "backward": "breaking", "forward": "compatible", "changes": [...], "unknown_reasons": []},
+    {"from": 2, "to": 2, "backward": "compatible", "forward": "compatible", "changes": [], "unknown_reasons": []}
+  ]
+}
+```
+
+With `revisions` omitted every committed revision is analyzed in ascending
+revision order; `--revisions` names an explicit ascending list. The
+`revisions` field lists the analyzed revision numbers in analysis order,
+and `pairs` covers every ordered pair of analyzed revisions, each
+self-comparison included, sorted by `from` then `to`. Each pair is exactly
+the report `compat(from, to)` produces — the two directions stay separate
+and `unknown` is never conflated with any other verdict. Every
+self-comparison is `compatible` in both directions with empty `changes`
+and `unknown_reasons`, even when that revision itself carries
+approximated branches; pairs touching an approximate branch elsewhere
+still return their full report and `unknown` reasons, and unrelated pairs
+are unaffected. Repeating the analysis for the same revisions returns the
+same JSON in the same order.
+
+With no history and no explicit revisions, the call raises
+`SchemaConflict` (exit `2`, no report). An empty list, a non-integer or
+non-positive value (a boolean included), a duplicate, or a non-increasing
+sequence raises `ValueError` (exit `2`, no report), as does a revision
+that does not exist, has been pruned or compacted into the baseline, or
+fails validation. A completed matrix exits `0` even when some verdicts
+are `breaking` or `unknown`; the JSON goes to stdout and any error to
+stderr.
 
 ## Tests
 

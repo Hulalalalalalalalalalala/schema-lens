@@ -82,6 +82,13 @@ depth-capped subtree) cannot be settled and makes both directions
 ``unknown``, listing its source in ``unknown_reasons`` with the same paths
 ``stats`` uses; a revision compared with itself is compatible in both
 directions with no changes.
+
+``compat_matrix`` bundles that pairwise report over several revisions at
+once. With no argument it covers every committed revision in ascending
+order; otherwise it covers the revisions named, which must be distinct
+positive integers in strictly ascending order. Every ordered pair, each
+self-comparison included, is reported independently and sorted by ``from``
+then ``to``; it reads only committed snapshots and changes nothing.
 """
 
 from __future__ import annotations
@@ -861,6 +868,53 @@ def _compat_report(
     return {"from": old_revision, "to": new_revision, **report}
 
 
+def _self_compat_report(revision: int) -> dict:
+    """A revision compared with itself.
+
+    A revision is known to accept its own records, so this is compatible in
+    both directions with no changes or unknown reasons even when the
+    snapshot itself carries approximated branches.
+    """
+    return {
+        "from": revision,
+        "to": revision,
+        "backward": _COMPATIBLE,
+        "forward": _COMPATIBLE,
+        "changes": [],
+        "unknown_reasons": [],
+    }
+
+
+def _validate_matrix_revisions(revisions: Any) -> list[int]:
+    """Validate an explicitly requested revision sequence.
+
+    The sequence must hold distinct positive integers (booleans rejected) in
+    strictly ascending order and be non-empty; a set or generator has no
+    guaranteed order so it is rejected rather than silently sorted.
+    """
+    if not isinstance(revisions, (list, tuple)):
+        raise ValueError(
+            "revisions must be a list of positive integers or None"
+        )
+    if not revisions:
+        raise ValueError("revisions must contain at least one revision")
+    numbers: list[int] = []
+    for value in revisions:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(
+                "revisions must be distinct positive integers given in "
+                "strictly ascending order"
+            )
+        numbers.append(value)
+    for earlier, later in zip(numbers, numbers[1:]):
+        if later <= earlier:
+            raise ValueError(
+                "revisions must be distinct positive integers given in "
+                "strictly ascending order"
+            )
+    return numbers
+
+
 def _normalize_overflow_names(node: Any) -> None:
     """Mark pre-tracking overflow entries with explicit ``names: None``.
 
@@ -1368,18 +1422,77 @@ class Lens:
         old_root = self._read_revision(old_revision)
         new_root = self._read_revision(new_revision)
         if old_revision == new_revision:
-            # A revision is known to accept its own records, so the
-            # self-comparison is compatible even when the snapshot itself
-            # carries approximated branches.
-            return {
-                "from": old_revision,
-                "to": new_revision,
-                "backward": _COMPATIBLE,
-                "forward": _COMPATIBLE,
-                "changes": [],
-                "unknown_reasons": [],
-            }
+            return _self_compat_report(old_revision)
         return _compat_report(old_revision, new_revision, old_root, new_root)
+
+    def compat_matrix(self, revisions: list[int] | None = None) -> dict:
+        """Cross-version compatibility over an ordered set of revisions.
+
+        With ``revisions`` omitted (or ``None``) every committed revision is
+        analyzed in ascending revision order; otherwise exactly the given
+        revisions are, and they must be distinct positive integers given in
+        strictly ascending order. The returned matrix holds one entry for
+        every ordered pair of analyzed revisions, including each revision
+        compared with itself, sorted by ``from`` then ``to``::
+
+            {
+              "revisions": [<revision>, ...],
+              "pairs": [
+                {"from": ..., "to": ..., "backward": ..., "forward": ...,
+                 "changes": [...], "unknown_reasons": [...]},
+                ...
+              ],
+            }
+
+        Each pair uses the same report ``compat(old, new)`` produces; the
+        two directions are never merged and ``unknown`` is never conflated
+        with another verdict. Every snapshot is read and fully validated
+        from disk without changing the open snapshot, memory or any
+        committed revision, and nothing is inferred, saved, rolled back or
+        compacted. Repeating the analysis for the same revisions returns
+        the same JSON in the same order.
+
+        An empty history (when no revisions are named) or a revision that is
+        missing, pruned or compacted away, or fails validation, raises
+        ``SchemaConflict``. An empty list, a non-positive or non-integer
+        value (booleans included), a duplicate, or a non-increasing sequence
+        raises ``ValueError``.
+        """
+        if revisions is None:
+            numbers = self.versions()
+            if not numbers:
+                raise SchemaConflict(
+                    f"no schema revisions in {self._versions_dir}"
+                )
+        else:
+            numbers = _validate_matrix_revisions(revisions)
+            # Every requested revision must be a readable committed snapshot
+            # before any pair is computed; ``versions`` also rejects a
+            # compacted-away number when it is resolved to a file.
+            available = set(self.versions())
+            missing = [n for n in numbers if n not in available]
+            if missing:
+                raise SchemaConflict(
+                    f"unknown schema revision: {missing[0]!r}"
+                )
+        # Read each snapshot once up front so the whole matrix fails on a
+        # missing or corrupt revision before any pair is reported.
+        roots = {number: self._read_revision(number) for number in numbers}
+        pairs: list[dict] = []
+        for old_revision in numbers:
+            for new_revision in numbers:
+                if old_revision == new_revision:
+                    pairs.append(_self_compat_report(old_revision))
+                else:
+                    pairs.append(
+                        _compat_report(
+                            old_revision,
+                            new_revision,
+                            roots[old_revision],
+                            roots[new_revision],
+                        )
+                    )
+        return {"revisions": list(numbers), "pairs": pairs}
 
     def stats(self) -> dict:
         """Report fields, optional fields, observed types and counts.
