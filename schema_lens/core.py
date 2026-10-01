@@ -82,6 +82,14 @@ depth-capped subtree) cannot be settled and makes both directions
 ``unknown``, listing its source in ``unknown_reasons`` with the same paths
 ``stats`` uses; a revision compared with itself is compatible in both
 directions with no changes.
+
+``compat_matrix(revisions=None)`` bundles that pairwise analysis into one
+report over several committed revisions: all of them by default in
+ascending order, or an explicitly given strictly increasing selection.
+Every ordered pair, self-comparisons included, appears sorted by
+``from`` then ``to`` with its own two directional verdicts, so upgrade and
+rollback risks sit side by side. It only reads committed snapshots, never
+infers, saves, rolls back, compacts or changes the open snapshot.
 """
 
 from __future__ import annotations
@@ -1380,6 +1388,91 @@ class Lens:
                 "unknown_reasons": [],
             }
         return _compat_report(old_revision, new_revision, old_root, new_root)
+
+    def compat_matrix(self, revisions: list[int] | tuple[int, ...] | None = None) -> dict:
+        """Compare every ordered pair of committed revisions both ways.
+
+        A read-only convenience over :meth:`compat` for upgrade/rollback
+        planning. With ``revisions`` omitted every committed logical
+        revision is analysed in ascending revision order; otherwise exactly
+        the given revisions are analysed, which must be positive integers
+        (booleans rejected) that are pairwise distinct and strictly
+        increasing. Returns one report::
+
+            {
+              "revisions": [<revision numbers in analysis order>],
+              "pairs": [
+                {"from": <old>, "to": <new>, "backward": ...,
+                 "forward": ..., "changes": [...],
+                 "unknown_reasons": [...]},
+                ...
+              ],
+            }
+
+        ``pairs`` covers every ordered combination, including each
+        revision compared with itself, sorted by ``from`` then ``to``; each
+        pair keeps the two directions separate and uses exactly the verdict
+        and change semantics of :meth:`compat`. Snapshots are read and
+        validated from disk only; the open snapshot, memory and every
+        committed revision are left untouched. An empty history with
+        ``revisions`` omitted raises ``SchemaConflict``; an empty selection
+        or any non-positive, boolean, duplicated or non-increasing value
+        raises ``ValueError``; a missing, pruned/compacted-away or corrupt
+        revision raises ``SchemaConflict``. Repeating the analysis with the
+        same inputs returns content-identical, order-identical JSON.
+        """
+        if revisions is None:
+            selected = self.versions()
+            if not selected:
+                raise SchemaConflict(
+                    f"no schema revisions in {self._versions_dir}"
+                )
+        else:
+            if not isinstance(revisions, (list, tuple)):
+                raise ValueError(
+                    "revisions must be a list of positive integers or None"
+                )
+            selected = list(revisions)
+            if not selected:
+                raise ValueError("revisions must not be empty")
+            previous = 0
+            for value in selected:
+                if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                    raise ValueError(
+                        "revisions must be positive integers without booleans"
+                    )
+                if value <= previous:
+                    raise ValueError(
+                        "revisions must be distinct and strictly increasing"
+                    )
+                previous = value
+        # Read every snapshot once before any pair is reported, so one
+        # missing or corrupt revision rejects the whole matrix.
+        roots = {revision: self._read_revision(revision) for revision in selected}
+        pairs: list[dict] = []
+        for old_revision in selected:
+            for new_revision in selected:
+                if old_revision == new_revision:
+                    pairs.append(
+                        {
+                            "from": old_revision,
+                            "to": new_revision,
+                            "backward": _COMPATIBLE,
+                            "forward": _COMPATIBLE,
+                            "changes": [],
+                            "unknown_reasons": [],
+                        }
+                    )
+                else:
+                    pairs.append(
+                        _compat_report(
+                            old_revision,
+                            new_revision,
+                            roots[old_revision],
+                            roots[new_revision],
+                        )
+                    )
+        return {"revisions": list(selected), "pairs": pairs}
 
     def stats(self) -> dict:
         """Report fields, optional fields, observed types and counts.

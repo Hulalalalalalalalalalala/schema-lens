@@ -20,6 +20,7 @@ Python 3.11 or newer. Standard library only.
     python3 -m schema_lens --path ./lens compact [--keep <revisions>] [--background]
     python3 -m schema_lens --path ./lens status
     python3 -m schema_lens --path ./lens compat <old-revision> <new-revision>
+    python3 -m schema_lens --path ./lens matrix [--revisions 1,2,3]
 
 `check` and `show` accept `--version <revision>` to target one specific
 committed revision; without it they use the snapshot loaded at open time.
@@ -36,6 +37,7 @@ committed revision; without it they use the snapshot loaded at open time.
 - `compact(*, keep=None, background=False) -> dict | None` merges the oldest history segment into one baseline version and returns `{"anchor": ..., "merged": [...]}` (or `None` when the history is already within the keep bound).
 - `compaction_status() -> dict` reports the committed baseline, the revisions merged into it, the live logical history and any background run in progress.
 - `compat(old_revision, new_revision) -> dict` reads two committed snapshots and reports how the evolution between them affects records legal under each side, without changing memory or any revision.
+- `compat_matrix(revisions=None) -> dict` reads committed snapshots for every revision (or a strictly increasing selection) and reports both directional verdicts for every ordered pair, self-comparisons included, in one matrix.
 - `stats() -> dict` reports fields, optional fields, observed types and observation counts.
 - `SchemaConflict` exported exception.
 
@@ -279,6 +281,56 @@ A missing, pruned/compacted-away or corrupt revision raises
 fewer or more than two revision numbers is an argument error (`2`, no
 report). A completed analysis exits `0` even when a verdict is `breaking`
 or `unknown`.
+
+## Cross-version compatibility matrix
+
+`compat_matrix(revisions=None)` (command: `matrix [--revisions 1,2,3]`)
+collects the pairwise reports of `compat` into one document for judging
+upgrade and rollback risk across several revisions. It is strictly
+read-only: it reads and validates the committed snapshots, never infers,
+commits, rolls back, compacts, or changes the open snapshot:
+
+```json
+{
+  "revisions": [1, 2],
+  "pairs": [
+    {"from": 1, "to": 1, "backward": "compatible", "forward": "compatible",
+     "changes": [], "unknown_reasons": []},
+    {"from": 1, "to": 2, "backward": "compatible", "forward": "breaking",
+     "changes": [{"path": "$.b", "change": "field_added", "breaking": false}],
+     "unknown_reasons": []},
+    {"from": 2, "to": 1, "backward": "breaking", "forward": "compatible",
+     "changes": [{"path": "$.b", "change": "field_removed", "breaking": true}],
+     "unknown_reasons": []},
+    {"from": 2, "to": 2, "backward": "compatible", "forward": "compatible",
+     "changes": [], "unknown_reasons": []}
+  ]
+}
+```
+
+`revisions` lists the analysed revision numbers in analysis order and
+`pairs` covers every ordered combination - including each revision
+compared with itself - sorted by `from` then `to`. Every pair carries
+its own `backward` and `forward` verdicts (`compatible`, `breaking` or
+`unknown`, the two directions never merged, and `unknown` never confused
+with another verdict), plus the same `changes` and `unknown_reasons` a
+single `compat` report would give for that pair. A self-comparison is
+`compatible` in both directions with empty `changes` and
+`unknown_reasons`, even when the revision carries approximated branches;
+pairs touching approximate fields or collapsed subtrees still report
+fully, including their unknown reasons, and all other pairs are
+unaffected.
+
+With `revisions` omitted every currently committed logical revision is
+analysed in ascending revision order; an explicit selection must contain
+distinct positive integers in strictly increasing order. An empty
+history with no selection raises `SchemaConflict`; an empty selection or
+a boolean, non-positive, duplicated or non-increasing value raises
+`ValueError`; a revision that does not exist, has been pruned or
+compacted away, or is corrupt raises `SchemaConflict`. The command exits
+`2` and prints no report in every one of those cases; on success it exits
+`0` with only the matrix JSON on stdout (errors go to stderr), and
+repeating the same inputs produces byte-identical content and ordering.
 
 ## Tests
 

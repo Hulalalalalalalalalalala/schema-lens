@@ -70,7 +70,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "command",
         choices=["infer", "check", "show", "versions", "rollback", "compact",
-                 "status", "compat"],
+                 "status", "compat", "matrix"],
     )
     parser.add_argument(
         "target",
@@ -82,6 +82,13 @@ def main(argv: list[str] | None = None) -> int:
         "target2",
         nargs="?",
         help="new revision number (compat only)",
+    )
+    parser.add_argument(
+        "--revisions",
+        default=None,
+        dest="matrix_revisions",
+        help="matrix: comma-separated revision numbers to compare, strictly "
+             "increasing (default: every committed revision)",
     )
     parser.add_argument(
         "--keep",
@@ -118,6 +125,24 @@ def main(argv: list[str] | None = None) -> int:
         return fail("compact takes no positional argument")
     if args.command == "status" and args.target is not None:
         return fail("status takes no positional argument")
+    if args.matrix_revisions is not None and args.command != "matrix":
+        return fail("--revisions is only valid with matrix")
+    if args.command == "matrix" and args.target is not None:
+        return fail("matrix takes no positional argument")
+    matrix_revisions: list[int] | None = None
+    if args.command == "matrix" and args.matrix_revisions is not None:
+        text = args.matrix_revisions.strip()
+        if text:
+            try:
+                matrix_revisions = [int(part) for part in text.split(",")]
+            except ValueError:
+                return fail(
+                    "matrix revisions must be a comma-separated list of integers"
+                )
+        else:
+            # An empty value stays an empty selection so the lens reports
+            # the same ValueError the public method raises.
+            matrix_revisions = []
     if args.command == "compat":
         if args.target is None or args.target2 is None:
             return fail("compat requires two revision numbers: <old> <new>")
@@ -182,6 +207,11 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "compat":
             report = lens.compat(compat_old, compat_new)
+            json.dump(report, sys.stdout, indent=2, sort_keys=True)
+            sys.stdout.write("\n")
+            return 0
+        if args.command == "matrix":
+            report = lens.compat_matrix(matrix_revisions)
             json.dump(report, sys.stdout, indent=2, sort_keys=True)
             sys.stdout.write("\n")
             return 0
