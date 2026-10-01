@@ -67,6 +67,21 @@ taken. Reads never wait on a compaction: while it runs they route through
 the old manifest to complete revisions, and afterwards the baseline is
 readable as its anchor revision while the revisions merged into it answer
 ``SchemaConflict``.
+
+``compat(old, new)`` reads two committed snapshots without changing memory
+or any revision and reports how the evolution between them affects the
+records each side accepts. One symmetric tree diff derives both directions
+at once, judged by the same rules ``check`` enforces: ``backward`` says
+whether the new revision still accepts records legal under the old one,
+``forward`` the reverse. Adding an optional field, relaxing a required
+field or widening a type set is non-breaking in the direction that accepts;
+removing a field, tightening optionality, narrowing a type set or dropping
+a nested type branch is breaking there. A branch either side only describes
+approximately (an overflow entry, an approximate field entry, or a
+depth-capped subtree) cannot be settled and makes both directions
+``unknown``, listing its source in ``unknown_reasons`` with the same paths
+``stats`` uses; a revision compared with itself is compatible in both
+directions with no changes.
 """
 
 from __future__ import annotations
@@ -601,6 +616,251 @@ def _check_value(types: dict, value: Any, path: str, reports: list[str]) -> None
             _check_value(node["elements"], element, f"{path}[{index}]", reports)
 
 
+# -- cross-revision compatibility -------------------------------------------
+#
+# Compatibility is read straight off the two committed schema trees, using
+# exactly what ``check`` decides with: a record is accepted when every
+# field it carries is a known (or genuinely overflow-folded) field whose
+# value kind is in the entry's type set, every required field is present,
+# and nested branches recurse. One symmetric walk therefore derives both
+# directions at once: ``backward`` asks whether the new tree accepts every
+# record the old tree accepts, ``forward`` the reverse.
+#
+# Each branch returns a ``(backward, forward)`` verdict pair. A branch
+# either tree can only describe approximately - an overflow entry that may
+# route the field, an entry flagged approximate, or a depth-capped subtree
+# - is unknown in both directions and lists its source, in the same paths
+# ``stats`` uses for approximated statistics (``$.*`` for an overflow
+# entry, the subtree's own path for a collapsed node). The one exception
+# is comparing a revision with itself: that revision is known to accept its
+# own records, so ``Lens.compat`` answers compatible in both directions
+# with no reasons after the revision has been read and validated.
+
+_COMPATIBLE = "compatible"
+_BREAKING = "breaking"
+_UNKNOWN = "unknown"
+
+
+def _combine_pair(pair: tuple[str, str], other: tuple[str, str]) -> tuple[str, str]:
+    return (_worst(pair[0], other[0]), _worst(pair[1], other[1]))
+
+
+def _worst(left: str, right: str) -> str:
+    """Aggregate branch verdicts for one direction.
+
+    A branch that demonstrably rejects a legal record settles the
+    direction as breaking even when another branch is unknowable; without
+    one of those an unknown branch degrades it to unknown.
+    """
+    if left == _BREAKING or right == _BREAKING:
+        return _BREAKING
+    if left == _UNKNOWN or right == _UNKNOWN:
+        return _UNKNOWN
+    return _COMPATIBLE
+
+
+def _overflow_live(entry: dict) -> bool:
+    """Whether an overflow entry can route a field name during check.
+
+    An entry with known but empty provenance routes nothing; an explicit
+    ``names: None`` (a pre-tracking overflow entry) routes any name.
+    """
+    names = entry.get("names", [])
+    return names is None or bool(names)
+
+
+def _overflow_routes(entry: dict | None, name: str) -> bool:
+    if entry is None or not _overflow_live(entry):
+        return False
+    names = entry.get("names")
+    return names is None or name in names
+
+
+class _CompatDiffer:
+    """Symmetric diff of two validated snapshots, aligned with ``check``."""
+
+    def __init__(self) -> None:
+        self.changes: list[dict] = []
+        self.reasons: set[str] = set()
+
+    def diff(self, old_root: dict, new_root: dict) -> dict:
+        backward, forward = self.compare_object(old_root, new_root, "$")
+        self.changes.sort(key=lambda change: (change["path"], change["change"]))
+        return {
+            "backward": backward,
+            "forward": forward,
+            "changes": self.changes,
+            "unknown_reasons": sorted(self.reasons),
+        }
+
+    def change(self, path: str, category: str, breaking: bool) -> None:
+        self.changes.append(
+            {"path": path, "change": category, "breaking": breaking}
+        )
+
+    def compare_object(self, old: dict, new: dict, path: str) -> tuple[str, str]:
+        if _is_collapsed(old) or _is_collapsed(new):
+            # A depth-capped object lets anything nested through check, so
+            # neither direction can be settled field by field.
+            self.reasons.add(path)
+            return _UNKNOWN, _UNKNOWN
+        verdict = _COMPATIBLE, _COMPATIBLE
+        old_fields = old["fields"]
+        new_fields = new["fields"]
+        old_overflow = old.get("overflow")
+        new_overflow = new.get("overflow")
+        for name in sorted(set(old_fields) | set(new_fields)):
+            field_path = _join(path, name)
+            old_entry = old_fields.get(name)
+            new_entry = new_fields.get(name)
+            if old_entry is not None and new_entry is not None:
+                verdict = _combine_pair(
+                    verdict, self.compare_entry(old_entry, new_entry, field_path)
+                )
+            elif old_entry is not None:
+                # The field disappears from the new exact fields. New check
+                # only accepts it when the name really folded into the new
+                # overflow entry, whose merged type set is approximate.
+                if _overflow_routes(new_overflow, name):
+                    self.reasons.add(_marker_path(path))
+                    verdict = _combine_pair(verdict, (_UNKNOWN, _UNKNOWN))
+                else:
+                    # New check rejects records carrying it; old records
+                    # omitting it additionally fail an old required field
+                    # under the forward direction.
+                    self.change(field_path, "field_removed", True)
+                    verdict = _combine_pair(
+                        verdict,
+                        (_BREAKING,
+                         _BREAKING if not old_entry["optional"] else _COMPATIBLE),
+                    )
+            else:
+                # The field appears only among the new exact fields. Old
+                # check accepts it only through its own overflow entry.
+                if _overflow_routes(old_overflow, name):
+                    self.reasons.add(_marker_path(path))
+                    verdict = _combine_pair(verdict, (_UNKNOWN, _UNKNOWN))
+                else:
+                    # Backward: an old record omits it, so a new required
+                    # field rejects that record while a new optional one
+                    # lets it through. Forward: old check calls any record
+                    # carrying it unexpected.
+                    self.change(
+                        field_path, "field_added", not new_entry["optional"]
+                    )
+                    verdict = _combine_pair(
+                        verdict,
+                        (_BREAKING if not new_entry["optional"] else _COMPATIBLE,
+                         _BREAKING),
+                    )
+        # A live overflow entry on either side folds names whose accepted
+        # branches cannot be attributed exactly; every branch it governs is
+        # unknown both ways. The marker can never be a real field name.
+        for entry in (old_overflow, new_overflow):
+            if entry is not None and _overflow_live(entry):
+                self.reasons.add(_marker_path(path))
+                verdict = _combine_pair(verdict, (_UNKNOWN, _UNKNOWN))
+        return verdict
+
+    def compare_entry(
+        self, old: dict, new: dict, path: str
+    ) -> tuple[str, str]:
+        if old.get("approximate") or new.get("approximate"):
+            # An entry flagged approximate absorbed overflow statistics in
+            # an exact field position; its accepted value set cannot be
+            # attributed precisely, so no change beneath it is asserted.
+            self.reasons.add(path)
+            return _UNKNOWN, _UNKNOWN
+        verdict = _COMPATIBLE, _COMPATIBLE
+        if old["optional"] != new["optional"]:
+            if old["optional"]:
+                # Optional becomes required: old records may omit it.
+                self.change(path, "optional_to_required", True)
+                verdict = (_BREAKING, _COMPATIBLE)
+            else:
+                # Required becomes optional: new records may omit it.
+                self.change(path, "required_to_optional", False)
+                verdict = (_COMPATIBLE, _BREAKING)
+        verdict = _combine_pair(
+            verdict, self.compare_types(old["types"], new["types"], path, "type")
+        )
+        return verdict
+
+    def compare_types(
+        self, old_types: dict, new_types: dict, path: str, prefix: str
+    ) -> tuple[str, str]:
+        verdict = _COMPATIBLE, _COMPATIBLE
+        for kind in _KINDS:
+            if kind not in old_types and kind not in new_types:
+                continue
+            old_node = old_types.get(kind)
+            new_node = new_types.get(kind)
+            if old_node is not None and new_node is not None:
+                verdict = _combine_pair(
+                    verdict, self.compare_kind(old_node, new_node, path)
+                )
+            elif old_node is not None:
+                # Records of this kind are legal on the old side but the
+                # new type set no longer contains it (narrowing).
+                self.change(path, f"{prefix}_{kind}_removed", True)
+                verdict = _combine_pair(verdict, (_BREAKING, _COMPATIBLE))
+            else:
+                # The new side widened with this kind; old check rejects
+                # new records that take it (forward breaking), while old
+                # records still pass the new, wider check.
+                self.change(path, f"{prefix}_{kind}_added", False)
+                verdict = _combine_pair(verdict, (_COMPATIBLE, _BREAKING))
+        return verdict
+
+    def compare_kind(
+        self, old_node: dict, new_node: dict, path: str
+    ) -> tuple[str, str]:
+        kind = old_node["kind"]
+        if kind in ("null", "boolean", "number", "string"):
+            return _COMPATIBLE, _COMPATIBLE
+        if kind == "object":
+            return self.compare_object(old_node, new_node, path)
+        return self.compare_arrays(old_node, new_node, path)
+
+    def compare_arrays(
+        self, old: dict, new: dict, path: str
+    ) -> tuple[str, str]:
+        """Compare array element branches under one schema-level path.
+
+        check walks every element against the single merged element type
+        set (a schema has no concrete indices), and it enforces that set
+        even for a depth-capped array - only a collapsed *child* hides
+        structure. So scalar element kinds gate exactly (rendered as
+        ``path[]``) and collapsed element objects taint beneath them;
+        element objects then join fields normally (``path[].name``).
+        """
+        element_path = f"{path}[]"
+        verdict = _COMPATIBLE, _COMPATIBLE
+        for kind in _KINDS:
+            if kind not in old["elements"] and kind not in new["elements"]:
+                continue
+            old_child = old["elements"].get(kind)
+            new_child = new["elements"].get(kind)
+            if old_child is not None and new_child is not None:
+                verdict = _combine_pair(
+                    verdict, self.compare_kind(old_child, new_child, element_path)
+                )
+            elif old_child is not None:
+                self.change(element_path, f"element_type_{kind}_removed", True)
+                verdict = _combine_pair(verdict, (_BREAKING, _COMPATIBLE))
+            else:
+                self.change(element_path, f"element_type_{kind}_added", False)
+                verdict = _combine_pair(verdict, (_COMPATIBLE, _BREAKING))
+        return verdict
+
+
+def _compat_report(
+    old_revision: int, new_revision: int, old_root: dict, new_root: dict
+) -> dict:
+    report = _CompatDiffer().diff(old_root, new_root)
+    return {"from": old_revision, "to": new_revision, **report}
+
+
 def _normalize_overflow_names(node: Any) -> None:
     """Mark pre-tracking overflow entries with explicit ``names: None``.
 
@@ -1070,6 +1330,56 @@ class Lens:
         if version is None:
             return self._require()
         return self._read_revision(version)
+
+    def compat(self, old_revision: int, new_revision: int) -> dict:
+        """Compare two committed revisions for cross-version compatibility.
+
+        Reads the two complete snapshots (old first, then new), each fully
+        validated from disk, without changing the open snapshot, memory or
+        any committed revision, and returns one report::
+
+            {
+              "from": <old revision>,
+              "to": <new revision>,
+              "backward": "compatible" | "breaking" | "unknown",
+              "forward": "compatible" | "breaking" | "unknown",
+              "changes": [{"path": ..., "change": ..., "breaking": ...}],
+              "unknown_reasons": [<paths that could not be compared>],
+            }
+
+        ``backward`` says whether the new revision accepts every record
+        legal under the old one and ``forward`` the reverse, judged by the
+        same rules ``check`` enforces. A missing, pruned/compacted-away or
+        corrupt revision raises ``SchemaConflict``. Repeating the analysis
+        for the same pair is stable, and a revision compared with itself is
+        compatible in both directions with no changes.
+        """
+        if (
+            isinstance(old_revision, bool)
+            or not isinstance(old_revision, int)
+            or old_revision < 1
+            or isinstance(new_revision, bool)
+            or not isinstance(new_revision, int)
+            or new_revision < 1
+        ):
+            raise SchemaConflict(
+                f"unknown schema revision: {old_revision!r}, {new_revision!r}"
+            )
+        old_root = self._read_revision(old_revision)
+        new_root = self._read_revision(new_revision)
+        if old_revision == new_revision:
+            # A revision is known to accept its own records, so the
+            # self-comparison is compatible even when the snapshot itself
+            # carries approximated branches.
+            return {
+                "from": old_revision,
+                "to": new_revision,
+                "backward": _COMPATIBLE,
+                "forward": _COMPATIBLE,
+                "changes": [],
+                "unknown_reasons": [],
+            }
+        return _compat_report(old_revision, new_revision, old_root, new_root)
 
     def stats(self) -> dict:
         """Report fields, optional fields, observed types and counts.

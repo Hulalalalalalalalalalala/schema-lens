@@ -69,12 +69,19 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "command",
-        choices=["infer", "check", "show", "versions", "rollback", "compact", "status"],
+        choices=["infer", "check", "show", "versions", "rollback", "compact",
+                 "status", "compat"],
     )
     parser.add_argument(
         "target",
         nargs="?",
-        help="JSONL records file (infer/check) or revision number (rollback)",
+        help="JSONL records file (infer/check), revision number (rollback) "
+             "or old revision number (compat)",
+    )
+    parser.add_argument(
+        "target2",
+        nargs="?",
+        help="new revision number (compat only)",
     )
     parser.add_argument(
         "--keep",
@@ -111,6 +118,17 @@ def main(argv: list[str] | None = None) -> int:
         return fail("compact takes no positional argument")
     if args.command == "status" and args.target is not None:
         return fail("status takes no positional argument")
+    if args.command == "compat":
+        if args.target is None or args.target2 is None:
+            return fail("compat requires two revision numbers: <old> <new>")
+        try:
+            compat_old = int(args.target)
+            compat_new = int(args.target2)
+        except ValueError:
+            return fail("compat revisions must be integers")
+    else:
+        if args.target2 is not None:
+            return fail("only compat takes two positional arguments")
     rollback_revision: int | None = None
     if args.command == "rollback":
         if args.target is None:
@@ -160,6 +178,11 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "versions":
             json.dump(lens.versions(), sys.stdout)
+            sys.stdout.write("\n")
+            return 0
+        if args.command == "compat":
+            report = lens.compat(compat_old, compat_new)
+            json.dump(report, sys.stdout, indent=2, sort_keys=True)
             sys.stdout.write("\n")
             return 0
         if args.command == "status":

@@ -19,6 +19,7 @@ Python 3.11 or newer. Standard library only.
     python3 -m schema_lens --path ./lens rollback <revision>
     python3 -m schema_lens --path ./lens compact [--keep <revisions>] [--background]
     python3 -m schema_lens --path ./lens status
+    python3 -m schema_lens --path ./lens compat <old-revision> <new-revision>
 
 `check` and `show` accept `--version <revision>` to target one specific
 committed revision; without it they use the snapshot loaded at open time.
@@ -34,6 +35,7 @@ committed revision; without it they use the snapshot loaded at open time.
 - `rollback(version) -> int` commits the target revision's schema again as a new revision and returns the new revision number.
 - `compact(*, keep=None, background=False) -> dict | None` merges the oldest history segment into one baseline version and returns `{"anchor": ..., "merged": [...]}` (or `None` when the history is already within the keep bound).
 - `compaction_status() -> dict` reports the committed baseline, the revisions merged into it, the live logical history and any background run in progress.
+- `compat(old_revision, new_revision) -> dict` reads two committed snapshots and reports how the evolution between them affects records legal under each side, without changing memory or any revision.
 - `stats() -> dict` reports fields, optional fields, observed types and observation counts.
 - `SchemaConflict` exported exception.
 
@@ -211,6 +213,72 @@ literally named `a.b` is reported as `$["a.b"]` and can never be confused
 with the nested path `$.a.b`. Backslashes are quoted the same way
 (`$["a\\b"]`), and a field literally named `*` reads as `$["*"]`, distinct
 from the `$.*` overflow marker.
+
+## Cross-revision compatibility
+
+`compat(old, new)` (command: `compat <old-revision> <new-revision>`) reads
+the two complete, fully validated snapshots and reports how the evolution
+from `old` to `new` affects records that were legal under each side. It
+never infers, commits, rolls back or changes the open snapshot, and it
+writes nothing but its JSON report:
+
+```json
+{
+  "from": 1,
+  "to": 2,
+  "backward": "compatible",
+  "forward": "breaking",
+  "changes": [
+    {"path": "$.tags", "change": "element_type_number_added", "breaking": false}
+  ],
+  "unknown_reasons": []
+}
+```
+
+`backward` says whether the new revision accepts every record the old
+revision accepted (can old records be read by the new schema?); `forward`
+says whether the old revision accepts every record the new revision
+accepts. Each verdict is one of `compatible`, `breaking` or `unknown`,
+judged by exactly what `check` does with the record shape, field
+optionality and the observed type sets — no defaults, enums or migrations
+are invented.
+
+In the accepting direction these evolutions are non-breaking; their
+inverses are breaking:
+
+- adding an *optional* field (new records may omit it; old records always
+  do), versus removing a field (records carrying it are now unexpected);
+- a required field becoming optional, versus an optional field becoming
+  required (records that omitted it are now rejected);
+- a type set widening (e.g. `number` to `number|string`), versus narrowing
+  or a type branch disappearing, including inside nested objects and array
+  elements.
+
+Objects and array elements are compared by the same rules. A schema has no
+concrete array indices, so an element-type branch renders with `[]`
+(`$.tags[]`) and fields of element objects join normally
+(`$.items[].name`). `changes` lists each changed path once with its
+category and a `breaking` flag, sorted by path then category. Field paths
+use the same notation as `check`: ordinary identifiers as `$.name`,
+non-identifier keys quoted as `$["a.b"]`, backslashes quoted
+(`$["a\\b"]`), and a field literally named `*` quoted as `$["*"]`, never
+confused with the `$.*` overflow marker.
+
+When an overflow entry or a depth-capped subtree on either side governs a
+branch, the accepted values there cannot be compared exactly, so both
+directions are `unknown` and the source is listed once in
+`unknown_reasons` (the same paths `stats()` uses: `$.*` for an overflow
+entry, the subtree's own path for a collapsed node). A demonstrable
+rejection elsewhere still reports that change and settles that direction
+as `breaking`. A revision compared with itself is `compatible` in both
+directions with no changes, and repeating an analysis of the same pair
+returns the same report.
+
+A missing, pruned/compacted-away or corrupt revision raises
+`SchemaConflict` (the command exits `2` and prints no report); giving
+fewer or more than two revision numbers is an argument error (`2`, no
+report). A completed analysis exits `0` even when a verdict is `breaking`
+or `unknown`.
 
 ## Tests
 
