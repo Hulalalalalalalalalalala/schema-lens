@@ -4034,6 +4034,436 @@ class MigrateTests(unittest.TestCase):
         self.assertEqual(record["items"][1]["tags"], ["t"])
 
 
+class MigrateRoundtripTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.lens = Lens(self.dir.name)
+
+    def _publish(self, records, revision, **limits):
+        return _publish(self.dir.name, records, revision, **limits)
+
+    def test_report_is_full_migrate_report_plus_rollback(self):
+        self._publish([{"a": 1, "b": "x"}, {"a": 2, "b": "y"}], 1)
+        self._publish([{"a": 1, "c": "x"}, {"a": 2, "c": "y"}], 2)
+        rules = [{"op": "rename", "path": ["b"], "to": "c"}]
+        back = [{"op": "rename", "path": ["c"], "to": "b"}]
+        report = self.lens.migrate_roundtrip(
+            {"a": 1, "b": "x"}, 1, 2, rules, back
+        )
+        self.assertEqual(
+            set(report),
+            {"from", "to", "backward", "forward", "changes",
+             "unknown_reasons", "migration", "rollback"},
+        )
+        forward = self.lens.migrate({"a": 1, "b": "x"}, 1, 2, rules)
+        for key in ("from", "to", "backward", "forward", "changes",
+                    "unknown_reasons", "migration"):
+            self.assertEqual(report[key], forward[key])
+        self.assertEqual(
+            report["rollback"],
+            {"stage": "done", "record": {"a": 1, "b": "x"},
+             "reports": [], "differences": []},
+        )
+
+    def test_successful_roundtrip_restores_record(self):
+        self._publish([{"items": [{"x": 1}, {"x": 2}]}], 1)
+        self._publish([{"items": [{"y": 1}, {"y": 2}]}], 2)
+        report = self.lens.migrate_roundtrip(
+            {"items": [{"x": 1}, {"x": 2}]}, 1, 2,
+            [{"op": "rename", "path": ["items", None, "x"], "to": "y"}],
+            [{"op": "rename", "path": ["items", None, "y"], "to": "x"}],
+        )
+        self.assertEqual(report["migration"]["stage"], "done")
+        self.assertEqual(
+            report["rollback"]["record"], {"items": [{"x": 1}, {"x": 2}]}
+        )
+        self.assertEqual(report["rollback"]["stage"], "done")
+        self.assertEqual(report["rollback"]["differences"], [])
+
+    def test_key_order_ignored_in_recovery_comparison(self):
+        # rev1 accepts both keys; the roundtrip renames move a key to a new
+        # position, so the recovered object differs only in key order.
+        self._publish([{"a": 1, "b": 2}], 1)
+        self._publish([{"a": 1, "c": 2}], 2)
+        report = self.lens.migrate_roundtrip(
+            {"b": 2, "a": 1}, 1, 2,
+            [{"op": "rename", "path": ["b"], "to": "c"}],
+            [{"op": "rename", "path": ["c"], "to": "b"}],
+        )
+        # The recovered object keeps the rename's position rather than
+        # being reordered, but comparison ignores key order.
+        self.assertEqual(list(report["rollback"]["record"]), ["b", "a"])
+        self.assertEqual(report["rollback"]["stage"], "done")
+        self.assertEqual(report["rollback"]["differences"], [])
+
+    def test_empty_rules_and_same_revision_roundtrip(self):
+        self._publish([{"a": 1}, {"a": 2}], 1)
+        report = self.lens.migrate_roundtrip({"a": 1}, 1, 1, [], [])
+        self.assertEqual(
+            report["migration"],
+            {"stage": "done", "record": {"a": 1}, "reports": []},
+        )
+        self.assertEqual(
+            report["rollback"],
+            {"stage": "done", "record": {"a": 1},
+             "reports": [], "differences": []},
+        )
+
+    def test_same_revision_applies_both_rule_groups(self):
+        # Revision 1 requires b and rejects an unexpected c: renaming b to c
+        # fails the forward target check, so no rollback rules ever run.
+        self._publish([{"a": 1, "b": 2}], 1)
+        report = self.lens.migrate_roundtrip(
+            {"a": 1, "b": 2}, 1, 1,
+            [{"op": "rename", "path": ["b"], "to": "c"}],
+            [{"op": "rename", "path": ["c"], "to": "b"}],
+        )
+        self.assertEqual(report["migration"]["stage"], "target")
+        self.assertEqual(
+            report["migration"]["reports"],
+            self.lens.check({"a": 1, "c": 2}, version=1),
+        )
+        self.assertIsNone(report["rollback"])
+
+    def test_forward_source_failure_keeps_source_result_and_null_rollback(self):
+        self._publish([{"a": 1}, {"a": 2}], 1)
+        self._publish([{"a": 3}, {"a": 4}], 2)
+        record = {"a": "bad", "extra": 1}
+        report = self.lens.migrate_roundtrip(
+            record, 1, 2, [{"op": "drop", "path": ["a"]}], []
+        )
+        self.assertEqual(
+            report["migration"],
+            self.lens.migrate(record, 1, 2, [{"op": "drop", "path": ["a"]}])[
+                "migration"
+            ],
+        )
+        self.assertEqual(report["migration"]["stage"], "source")
+        self.assertIsNone(report["rollback"])
+
+    def test_forward_target_failure_keeps_target_result_and_null_rollback(self):
+        self._publish([{"a": 1, "b": "x"}, {"a": 2, "b": "y"}], 1)
+        record = {"a": 1, "b": "x"}
+        rules = [{"op": "drop", "path": ["a"]}]
+        report = self.lens.migrate_roundtrip(record, 1, 1, rules, [])
+        self.assertEqual(report["migration"]["stage"], "target")
+        self.assertIsNone(report["migration"]["record"])
+        self.assertIsNone(report["rollback"])
+
+    def test_invalid_rollback_rule_raises_even_when_source_check_fails(self):
+        self._publish([{"a": 1}], 1)
+        self._publish([{"a": 2}], 2)
+        with self.assertRaises(ValueError):
+            self.lens.migrate_roundtrip(
+                {"a": "bad"}, 1, 2,
+                [], [{"op": "drop", "path": "a"}],
+            )
+
+    def test_invalid_rollback_rule_raises_even_when_target_check_fails(self):
+        self._publish([{"a": 1, "b": "x"}], 1)
+        with self.assertRaises(ValueError):
+            self.lens.migrate_roundtrip(
+                {"a": 1, "b": "x"}, 1, 1,
+                [{"op": "drop", "path": ["a"]}],
+                [{"op": "move", "path": ["a"]}],
+            )
+
+    def test_invalid_rollback_rule_structures_raise(self):
+        self._publish([{"a": 1}], 1)
+        bad_groups = [
+            [{"op": "drop"}],
+            [{"op": "drop", "path": []}],
+            [{"op": "drop", "path": [None]}],
+            "not-a-list",
+            [{"op": "rename", "path": ["a"]}],
+            [{"op": "rename", "path": ["a"], "to": "a"}],
+            [{"op": "default", "path": ["a"]}],
+            [{"op": "default", "path": ["a"], "value": float("inf")}],
+        ]
+        for rollback_rules in bad_groups:
+            with self.subTest(rollback_rules=rollback_rules):
+                with self.assertRaises(ValueError):
+                    self.lens.migrate_roundtrip(
+                        {"a": 1}, 1, 1, [], rollback_rules
+                    )
+
+    def test_rollback_runtime_path_error_raises_after_forward_done(self):
+        self._publish([{"a": [1]}, {"a": {"b": 2}}], 1)
+        with self.assertRaises(ValueError):
+            self.lens.migrate_roundtrip(
+                {"a": {"b": 2}}, 1, 1,
+                [],
+                [{"op": "drop", "path": ["a", None, "b"]}],
+            )
+
+    def test_rollback_rename_conflict_raises(self):
+        self._publish([{"a": 1, "b": 2}], 1)
+        with self.assertRaises(ValueError):
+            self.lens.migrate_roundtrip(
+                {"a": 1, "b": 2}, 1, 1,
+                [],
+                [{"op": "rename", "path": ["a"], "to": "b"}],
+            )
+
+    def test_rollback_target_failure_reports_target_stage(self):
+        self._publish([{"a": 1, "b": "x"}, {"a": 2, "b": "y"}], 1)
+        self._publish([{"a": 1, "c": "x"}, {"a": 2, "c": "y"}], 2)
+        report = self.lens.migrate_roundtrip(
+            {"a": 1, "b": "x"}, 1, 2,
+            [{"op": "rename", "path": ["b"], "to": "c"}],
+            [
+                {"op": "drop", "path": ["c"]},
+                {"op": "default", "path": ["b"], "value": 1},
+            ],
+        )
+        rollback = report["rollback"]
+        self.assertEqual(rollback["stage"], "target")
+        self.assertIsNone(rollback["record"])
+        self.assertEqual(
+            rollback["reports"],
+            self.lens.check({"a": 1, "b": 1}, version=1),
+        )
+        self.assertTrue(rollback["reports"])
+        self.assertEqual(rollback["differences"], [])
+
+    def _difference_roundtrip(self, original, recovered_rules):
+        """Forward no-op self-migration; rollback rules shape the recovery."""
+        return self.lens.migrate_roundtrip(
+            original, 1, 1, [], recovered_rules
+        )["rollback"]
+
+    def test_different_missing_key_names_field_path(self):
+        self._publish([{"a": 1, "b": "x"}, {"a": 2}], 1)
+        rollback = self._difference_roundtrip(
+            {"a": 1, "b": "x"}, [{"op": "drop", "path": ["b"]}]
+        )
+        self.assertEqual(rollback["stage"], "different")
+        self.assertEqual(rollback["record"], {"a": 1})
+        self.assertEqual(rollback["reports"], [])
+        self.assertEqual(rollback["differences"], ["$.b"])
+
+    def test_missing_distinguished_from_null_in_both_directions(self):
+        self._publish([{"b": None}, {}], 1)
+        present_null = self._difference_roundtrip(
+            {"b": None}, [{"op": "drop", "path": ["b"]}]
+        )
+        self.assertEqual(present_null["differences"], ["$.b"])
+        absent = self._difference_roundtrip(
+            {}, [{"op": "default", "path": ["b"], "value": None}]
+        )
+        self.assertEqual(absent["differences"], ["$.b"])
+
+    def test_boolean_distinguished_from_number(self):
+        self._publish([{"a": True}, {"a": False}, {"a": 1}, {}], 1)
+        rollback = self._difference_roundtrip(
+            {"a": True},
+            [{"op": "drop", "path": ["a"]},
+             {"op": "default", "path": ["a"], "value": 1}],
+        )
+        self.assertEqual(rollback["differences"], ["$.a"])
+
+    def test_ints_and_floats_compare_numerically(self):
+        self._publish([{"a": 1}, {"a": 2.5}, {"a": 1.5}, {}], 1)
+        equal = self._difference_roundtrip(
+            {"a": 1},
+            [{"op": "drop", "path": ["a"]},
+             {"op": "default", "path": ["a"], "value": 1.0}],
+        )
+        self.assertEqual(equal["stage"], "done")
+        self.assertEqual(equal["differences"], [])
+        unequal = self._difference_roundtrip(
+            {"a": 1},
+            [{"op": "drop", "path": ["a"]},
+             {"op": "default", "path": ["a"], "value": 1.5}],
+        )
+        self.assertEqual(unequal["stage"], "different")
+        self.assertEqual(unequal["differences"], ["$.a"])
+
+    def test_equal_length_arrays_compare_by_index(self):
+        self._publish([{"a": [1, 2]}, {}], 1)
+        rollback = self._difference_roundtrip(
+            {"a": [1, 2]},
+            [{"op": "drop", "path": ["a"]},
+             {"op": "default", "path": ["a"], "value": [1, 3]}],
+        )
+        self.assertEqual(rollback["differences"], ["$.a[1]"])
+
+    def test_unequal_array_length_names_only_array_path(self):
+        self._publish([{"a": [1]}, {"a": [1, 2]}, {}], 1)
+        rollback = self._difference_roundtrip(
+            {"a": [1, 2]},
+            [{"op": "drop", "path": ["a"]},
+             {"op": "default", "path": ["a"], "value": [1]}],
+        )
+        self.assertEqual(rollback["differences"], ["$.a"])
+
+    def test_type_mismatch_does_not_expand(self):
+        self._publish([{"a": {"b": 1}}, {"a": 2}, {"a": {}}, {}], 1)
+        rollback = self._difference_roundtrip(
+            {"a": {"b": 1}},
+            [{"op": "drop", "path": ["a"]},
+             {"op": "default", "path": ["a"], "value": 2}],
+        )
+        self.assertEqual(rollback["differences"], ["$.a"])
+
+    def test_nested_object_differences_recurse_key_by_key(self):
+        self._publish([{"a": {"b": 1, "c": 2}}, {"a": {}}], 1)
+        rollback = self._difference_roundtrip(
+            {"a": {"b": 1, "c": 2}},
+            [{"op": "drop", "path": ["a", "c"]}],
+        )
+        self.assertEqual(rollback["differences"], ["$.a.c"])
+
+    def test_dotted_key_uses_quoted_path_and_differences_are_sorted(self):
+        records = [
+            {"a.b": 1, "c": 2, "d": 3},
+            {},
+            {"a.b": 1},
+            {"c": 2},
+            {"d": 3},
+        ]
+        self._publish(records, 1)
+        rollback = self._difference_roundtrip(
+            {"a.b": 1, "c": 2, "d": 3},
+            [
+                {"op": "drop", "path": ["d"]},
+                {"op": "drop", "path": ["c"]},
+                {"op": "drop", "path": ["a.b"]},
+            ],
+        )
+        self.assertEqual(
+            rollback["differences"], ["$.c", "$.d", '$["a.b"]']
+        )
+
+    def test_approximate_check_passes_but_comparison_covers_real_data(self):
+        # A depth-capped old revision cannot inspect inside ``a``, so the
+        # recovered object passes check even though a nested value changed;
+        # the recovery comparison must still report the real difference.
+        self._publish([{"a": {"b": 1}}], 1, max_depth=0)
+        self._publish([{"a": {"c": 1}}], 2, max_depth=0)
+        report = self.lens.migrate_roundtrip(
+            {"a": {"b": 1}}, 1, 2,
+            [{"op": "rename", "path": ["a", "b"], "to": "c"}],
+            [
+                {"op": "drop", "path": ["a", "c"]},
+                {"op": "default", "path": ["a", "b"], "value": 2},
+            ],
+        )
+        self.assertEqual(report["migration"]["stage"], "done")
+        rollback = report["rollback"]
+        self.assertEqual(rollback["stage"], "different")
+        self.assertEqual(rollback["reports"], [])
+        self.assertEqual(rollback["record"], {"a": {"b": 2}})
+        self.assertEqual(rollback["differences"], ["$.a.b"])
+
+    def test_non_object_record_and_non_json_values_raise(self):
+        self._publish([{"a": 1}], 1)
+        for record in ([1], "x", 1, None, {"a": {1, 2}}, {"a": float("nan")}):
+            with self.subTest(record=record):
+                with self.assertRaises(ValueError):
+                    self.lens.migrate_roundtrip(record, 1, 1, [], [])
+
+    def test_invalid_and_missing_revisions_raise_conflict(self):
+        self._publish([{"a": 1}], 1)
+        for old, new in ((0, 1), (1, -1), (True, 1), ("1", 1), (1, 2)):
+            with self.subTest(old=old, new=new):
+                with self.assertRaises(SchemaConflict):
+                    self.lens.migrate_roundtrip({"a": 1}, old, new, [], [])
+
+    def test_corrupt_and_compacted_revisions_raise_conflict(self):
+        self._publish([{"a": 1}], 1)
+        self._publish([{"a": 2}], 2)
+        revision_path(self.dir.name, 2).write_text("not json", encoding="utf-8")
+        with self.assertRaises(SchemaConflict):
+            self.lens.migrate_roundtrip({"a": 1}, 1, 2, [], [])
+        other = tempfile.TemporaryDirectory()
+        self.addCleanup(other.cleanup)
+        lens = _build_history(other.name, 5, compact_keep=2)
+        lens.compact()
+        with self.assertRaises(SchemaConflict):
+            lens.migrate_roundtrip({}, 1, 4, [], [])
+        report = lens.migrate_roundtrip({"f2": 2, "shared": "s"}, 3, 4, [], [])
+        self.assertEqual(report["migration"]["stage"], "done")
+        self.assertEqual(report["rollback"]["stage"], "done")
+
+    def test_repeated_roundtrip_is_stable(self):
+        self._publish([{"a": 1, "b": "x"}], 1)
+        self._publish([{"a": 1, "c": "x"}], 2)
+        rules = [{"op": "rename", "path": ["b"], "to": "c"}]
+        back = [{"op": "drop", "path": ["c"]}]
+        first = self.lens.migrate_roundtrip(
+            {"a": 1, "b": "x"}, 1, 2, rules, back
+        )
+        encoded = json.dumps(first)
+        for _ in range(3):
+            self.assertEqual(
+                encoded,
+                json.dumps(
+                    self.lens.migrate_roundtrip(
+                        {"a": 1, "b": "x"}, 1, 2, rules, back
+                    )
+                ),
+            )
+
+    def test_inputs_and_state_are_untouched(self):
+        self._publish([{"a": 1, "b": "x"}], 1)
+        self._publish([{"a": 1, "c": "x"}], 2)
+        self.lens.infer([{"pending": 1}])
+        snapshot = self.lens.schema()
+        versions_dir = Path(self.dir.name, VERSIONS_DIRNAME)
+        before = sorted(os.listdir(versions_dir))
+        record = {"a": 1, "b": "x"}
+        rules = [{"op": "rename", "path": ["b"], "to": "c"}]
+        back = [
+            {"op": "rename", "path": ["c"], "to": "b"},
+            {"op": "default", "path": ["d"], "value": ["e"]},
+        ]
+        self.lens.migrate_roundtrip(record, 1, 2, rules, back)
+        self.assertEqual(record, {"a": 1, "b": "x"})
+        self.assertEqual(rules, [{"op": "rename", "path": ["b"], "to": "c"}])
+        self.assertEqual(
+            back,
+            [
+                {"op": "rename", "path": ["c"], "to": "b"},
+                {"op": "default", "path": ["d"], "value": ["e"]},
+            ],
+        )
+        self.assertEqual(self.lens.schema(), snapshot)
+        self.assertEqual(self.lens.versions(), [1, 2])
+        self.assertEqual(self.lens.check({"pending": 1}), [])
+        self.assertEqual(sorted(os.listdir(versions_dir)), before)
+
+    def test_returned_records_are_independent_copies(self):
+        self._publish(
+            [{"items": [{"x": 1, "tags": ["t"]}, {"x": 2}]}], 1
+        )
+        self._publish(
+            [{"items": [{"y": 1, "tags": ["t"]}, {"y": 2}]}], 2
+        )
+        rules = [{"op": "rename", "path": ["items", None, "x"], "to": "y"}]
+        back = [
+            {"op": "rename", "path": ["items", None, "y"], "to": "x"},
+            {"op": "default", "path": ["items", None, "tags"], "value": ["t"]},
+        ]
+        first = self.lens.migrate_roundtrip(
+            {"items": [{"x": 1}, {"x": 2}]}, 1, 2, rules, back
+        )
+        record = first["rollback"]["record"]
+        self.assertEqual(
+            record,
+            {"items": [{"x": 1, "tags": ["t"]}, {"x": 2, "tags": ["t"]}]},
+        )
+        record["items"][0]["tags"].append("u")
+        again = self.lens.migrate_roundtrip(
+            {"items": [{"x": 1}, {"x": 2}]}, 1, 2, rules, back
+        )
+        self.assertEqual(
+            again["rollback"]["record"]["items"][0]["tags"], ["t"]
+        )
+        self.assertEqual(back[1]["value"], ["t"])
+
+
 if __name__ == "__main__":
     unittest.main()
 

@@ -41,6 +41,7 @@ committed revision; without it they use the snapshot loaded at open time.
 - `compat_witness(old_revision, new_revision) -> dict` returns the same report as `compat` plus a `witnesses` object with a concrete, `check`-verified counterexample for each breaking direction (`null` for compatible/unknown, both `null` on a self-comparison), without changing memory or any revision.
 - `compat_matrix(revisions=None) -> dict` reads committed snapshots for every revision (or a strictly increasing selection) and reports both directional verdicts for every ordered pair, self-comparisons included, in one matrix.
 - `migrate(record, old_revision, new_revision, rules) -> dict` returns the `compat` report for the pair plus a `migration` object previewing an explicit field-level migration of one JSON object: check against the old revision, apply the rename/drop/default rules in order, check against the new revision. Read-only like `compat`.
+- `migrate_roundtrip(record, old_revision, new_revision, rules, rollback_rules) -> dict` returns the full `migrate` report plus a `rollback` object, rehearsing whether the rollback rules restore the original object: rollback rules run only after the forward preview reaches `done`, the recovered record is checked against the old revision, then compared with the original key by key ignoring key order. Read-only like `migrate`.
 - `stats() -> dict` reports fields, optional fields, observed types and observation counts.
 - `SchemaConflict` exported exception.
 
@@ -451,6 +452,67 @@ entry points. Nothing else is written and nothing shared is mutated:
 the input record and rules, the open snapshot, uncommitted batches and
 every committed revision are exactly as they were, and the same input
 always returns the same content in the same order.
+
+## Rollback rehearsal
+
+`migrate_roundtrip(record, old_revision, new_revision, rules,
+rollback_rules)` (Python only) extends the migration preview with a
+rollback rehearsal. It returns the complete `migrate` report unchanged
+plus one `rollback` object:
+
+```json
+{
+  "from": 1, "to": 2,
+  "backward": "compatible", "forward": "breaking",
+  "changes": [...], "unknown_reasons": [],
+  "migration": {"stage": "done", "record": {"a": 1, "c": "x"}, "reports": []},
+  "rollback": {"stage": "done", "record": {"a": 1, "b": "x"},
+               "reports": [], "differences": []}
+}
+```
+
+The record and both rule groups are validated completely before either
+revision is read: `rollback_rules` uses the same rename/drop/default
+operations, path semantics and `ValueError` rules as `rules`, and an
+invalid rollback rule raises even when the forward source or target
+check fails. The rollback rules run in their own order only after the
+forward preview reaches `done`; when the forward preview stops at
+`source` or `target`, `migration` is exactly what `migrate` returns and
+`rollback` is `null`. Empty rule groups and same-revision roundtrips
+validate exactly as for `migrate`.
+
+The recovered record is first checked against the old revision with
+the same rules `check` uses (approximate branches still go through
+`check`): when that check fails, `stage` is `"target"`, `record` is
+`null`, `reports` is the full list the old revision's `check` returns
+and `differences` is empty. When it passes, `reports` is empty and the
+recovered record is returned; `stage` is `"done"` with no differences
+when it equals the original object, otherwise `"different"` with every
+differing path in `differences`.
+
+The recovery comparison ignores object key order and compares objects
+key by key; equal-length arrays compare element by element. A key one
+side lacks records that field's path. A type difference, an unequal
+array length or unequal scalars record only the current position and
+never expand it. A missing field is distinct from a present `null`,
+booleans are distinct from numbers, and integers and floats compare by
+numeric value. Paths reuse the `check` field and array-index notation
+(`$.items[0]["a.b"]`), de-duplicated and sorted as strings. Approximate
+branches only relax the old-revision check; even when check passes
+because a subtree was approximated, the comparison covers all the real
+data the recovered record carries.
+
+A rollback rule hitting a structural error while it runs (a string
+segment on a non-object, a `null` segment on a non-array, or a rename
+onto an existing field) raises `ValueError`, and invalid revisions or
+missing, pruned/compacted-away, unreadable or corrupt revisions raise
+`SchemaConflict`, with the compaction anchor and legacy single-file
+migration keeping their existing semantics. The rehearsal changes
+nothing: apart from the one legacy layout migration a first read may
+perform, nothing is written and the input record, both rule lists, the
+open snapshot, uncommitted batches and every committed revision are
+exactly as they were; repeating the call returns identical content and
+order.
 
 ## Tests
 
