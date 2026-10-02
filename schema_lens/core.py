@@ -137,6 +137,28 @@ forward preview stops at ``"source"`` or ``"target"`` the ``rollback``
 object is ``null``. Both rule groups are fully validated together with
 the record before either revision is read, so an invalid rollback rule
 is reported even when the forward check fails.
+
+``migrate_stream(records, old_revision, new_revision, rules,
+rollback_rules=None)`` runs the same preview over an iterable of records
+and returns an iterator of per-record results, one record consumed per
+iteration with no prefetch and no retention that grows with the batch.
+The entry validates both rule groups, then the revision numbers and both
+complete snapshots, and only then obtains the records iterator, so an
+illegal rule or a non-iterable ``records`` raises ``ValueError`` and an
+invalid, missing, compacted-away, unreadable or corrupt revision raises
+``SchemaConflict`` before a single record is consumed - an empty input
+is checked the same way and yields nothing. Each result carries a
+1-based continuous ``index``, a ``report`` and an ``error``; with
+``rollback_rules`` omitted the report is the ``migrate`` report and with
+a list (an empty one included) it is the ``migrate_roundtrip`` report.
+A record that is not an object, carries a non-JSON value, or makes a
+forward/rollback rule raise ``ValueError`` yields ``report: null`` and
+the exception message in ``error`` and the stream continues; a raising
+records iterator propagates its non-``StopIteration`` exception
+unchanged. The snapshots and rules are frozen for the batch, so later
+commits, compaction or caller mutation cannot change results; the
+preview is otherwise read-only apart from the one legacy layout
+migration a first read may perform.
 """
 
 from __future__ import annotations
@@ -1425,6 +1447,117 @@ def _structural_diff_paths(original: dict, recovered: dict) -> list[str]:
     return sorted(set(_structural_differences(original, recovered, "$")))
 
 
+# -- single-record migration/roundtrip preview ------------------------------
+#
+# ``migrate``, ``migrate_roundtrip`` and the per-record reports of
+# ``migrate_stream`` share one pipeline below. The pair's ``compat`` report
+# is built once from the two validated snapshots and deep-copied per
+# record, so individual previews never share mutable report state; the
+# forward preview and the rollback rehearsal are pure functions of the
+# record, the two roots and the already-validated rule groups.
+
+
+def _pair_compat_report(
+    old_revision: int, new_revision: int, old_root: dict, new_root: dict
+) -> dict:
+    """The compat report for one pair, with the self-pair shortcut."""
+    if old_revision == new_revision:
+        return {
+            "from": old_revision,
+            "to": new_revision,
+            "backward": _COMPATIBLE,
+            "forward": _COMPATIBLE,
+            "changes": [],
+            "unknown_reasons": [],
+        }
+    return _compat_report(old_revision, new_revision, old_root, new_root)
+
+
+def _forward_migration(
+    base_report: dict,
+    record: dict,
+    old_root: dict,
+    new_root: dict,
+    parsed_rules: list[dict],
+) -> tuple[dict, dict | None]:
+    """Run the source-check/rules/target-check forward preview.
+
+    Returns a fresh report (the pair's compat report plus ``migration``)
+    and, only when the preview reaches ``"done"``, the migrated working
+    record. The only errors raised from here are structural ``ValueError``
+    encountered while rules run.
+    """
+    report = copy.deepcopy(base_report)
+    migrated = copy.deepcopy(record)
+    source_reports = _check_against(old_root, migrated)
+    if source_reports:
+        report["migration"] = {
+            "stage": "source",
+            "record": None,
+            "reports": source_reports,
+        }
+        return report, None
+    for rule in parsed_rules:
+        _apply_migration_rule(migrated, rule)
+    target_reports = _check_against(new_root, migrated)
+    if target_reports:
+        report["migration"] = {
+            "stage": "target",
+            "record": None,
+            "reports": target_reports,
+        }
+        return report, None
+    report["migration"] = {"stage": "done", "record": migrated, "reports": []}
+    return report, migrated
+
+
+def _migration_preview(
+    record: dict,
+    base_report: dict,
+    old_root: dict,
+    new_root: dict,
+    parsed_rules: list[dict],
+    parsed_rollback_rules: list[dict] | None,
+) -> dict:
+    """The complete one-record preview shared by all migration entry points.
+
+    With ``parsed_rollback_rules`` left as ``None`` the report is the
+    ``migrate`` report (no ``rollback`` key); with a list (an empty list
+    included) it is the ``migrate_roundtrip`` report. Every structural
+    problem a rule hits while it runs propagates as ``ValueError``.
+    """
+    report, migrated = _forward_migration(
+        base_report, record, old_root, new_root, parsed_rules
+    )
+    if parsed_rollback_rules is None:
+        return report
+    if report["migration"]["stage"] != "done":
+        report["rollback"] = None
+        return report
+    # The rollback works on its own copy so the forward migration record in
+    # the report stays the migrated object.
+    recovered = copy.deepcopy(migrated)
+    for rule in parsed_rollback_rules:
+        _apply_migration_rule(recovered, rule)
+    reports = _check_against(old_root, recovered)
+    if reports:
+        report["rollback"] = {
+            "stage": "target",
+            "record": None,
+            "reports": reports,
+            "differences": [],
+        }
+        return report
+    differences = _structural_diff_paths(record, recovered)
+    report["rollback"] = {
+        "stage": "different" if differences else "done",
+        "record": recovered,
+        "reports": [],
+        "differences": differences,
+    }
+    return report
+
+
 def _normalize_overflow_names(node: Any) -> None:
     """Mark pre-tracking overflow entries with explicit ``names: None``.
 
@@ -2091,20 +2224,15 @@ class Lens:
                 f"unknown schema revision: {old_revision!r}, {new_revision!r}"
             )
 
-    def _migration_report(
-        self,
-        record: Any,
-        old_revision: int,
-        new_revision: int,
-        parsed_rules: list[dict],
-    ) -> tuple[dict, dict | None, dict | None]:
-        """Build the compat report and forward migration preview.
+    def _migration_inputs(
+        self, old_revision: int, new_revision: int
+    ) -> tuple[dict, dict, dict]:
+        """Read and validate both snapshots and build the pair report.
 
-        Returns the report, the source revision's schema root and, when
-        the preview reaches ``"done"``, the migrated working record. The
-        record and every rule group have already been validated, so the
-        only failures raised from here are revision/state conflicts and
-        structural rule errors encountered while rules run.
+        Returns the old root, the new root and the pair's compat report.
+        The self-pair reads its one snapshot once. A missing,
+        pruned/compacted-away or corrupt revision raises
+        ``SchemaConflict``.
         """
         old_root = self._read_revision(old_revision)
         new_root = (
@@ -2112,38 +2240,11 @@ class Lens:
             if old_revision == new_revision
             else self._read_revision(new_revision)
         )
-        if old_revision == new_revision:
-            report: dict[str, Any] = {
-                "from": old_revision,
-                "to": new_revision,
-                "backward": _COMPATIBLE,
-                "forward": _COMPATIBLE,
-                "changes": [],
-                "unknown_reasons": [],
-            }
-        else:
-            report = _compat_report(old_revision, new_revision, old_root, new_root)
-        migrated = copy.deepcopy(record)
-        source_reports = _check_against(old_root, migrated)
-        if source_reports:
-            report["migration"] = {
-                "stage": "source",
-                "record": None,
-                "reports": source_reports,
-            }
-            return report, old_root, None
-        for rule in parsed_rules:
-            _apply_migration_rule(migrated, rule)
-        target_reports = _check_against(new_root, migrated)
-        if target_reports:
-            report["migration"] = {
-                "stage": "target",
-                "record": None,
-                "reports": target_reports,
-            }
-            return report, old_root, None
-        report["migration"] = {"stage": "done", "record": migrated, "reports": []}
-        return report, old_root, migrated
+        return (
+            old_root,
+            new_root,
+            _pair_compat_report(old_revision, new_revision, old_root, new_root),
+        )
 
     def migrate(
         self,
@@ -2191,10 +2292,17 @@ class Lens:
             raise ValueError("record must be a JSON object")
         _require_json_value(record, "record")
         parsed_rules = _parse_migration_rules(rules)
-        report, _root, _migrated = self._migration_report(
-            record, old_revision, new_revision, parsed_rules
+        old_root, new_root, base_report = self._migration_inputs(
+            old_revision, new_revision
         )
-        return report
+        return _migration_preview(
+            record,
+            base_report,
+            old_root,
+            new_root,
+            parsed_rules,
+            None,
+        )
 
     def migrate_roundtrip(
         self,
@@ -2261,34 +2369,131 @@ class Lens:
         parsed_rollback_rules = _parse_migration_rules(
             rollback_rules, label="rollback rule"
         )
-        report, old_root, migrated = self._migration_report(
-            record, old_revision, new_revision, parsed_rules
+        old_root, new_root, base_report = self._migration_inputs(
+            old_revision, new_revision
         )
-        if report["migration"]["stage"] != "done":
-            report["rollback"] = None
-            return report
-        # The rollback works on its own copy so the forward migration
-        # record in the report stays the migrated object.
-        recovered = copy.deepcopy(migrated)
-        for rule in parsed_rollback_rules:
-            _apply_migration_rule(recovered, rule)
-        reports = _check_against(old_root, recovered)
-        if reports:
-            report["rollback"] = {
-                "stage": "target",
-                "record": None,
-                "reports": reports,
-                "differences": [],
-            }
-            return report
-        differences = _structural_diff_paths(record, recovered)
-        report["rollback"] = {
-            "stage": "different" if differences else "done",
-            "record": recovered,
-            "reports": [],
-            "differences": differences,
-        }
-        return report
+        return _migration_preview(
+            record,
+            base_report,
+            old_root,
+            new_root,
+            parsed_rules,
+            parsed_rollback_rules,
+        )
+
+    def migrate_stream(
+        self,
+        records: Iterable[Any],
+        old_revision: int,
+        new_revision: int,
+        rules: list,
+        rollback_rules: list | None = None,
+    ) -> Iterator[dict]:
+        """Stream a field-migration preview over many JSON records.
+
+        Every record is previewed against the same fixed pair of
+        committed revisions and the same already-validated rule groups,
+        using exactly the pipeline :meth:`migrate` (``rollback_rules``
+        omitted) or :meth:`migrate_roundtrip` (a list, an empty one
+        included) uses; each yielded result is::
+
+            {"index": <1-based>, "report": <preview report> | None,
+             "error": <message> | None}
+
+        A record that is not a JSON object, carries a non-JSON value, or
+        makes a forward or rollback rule raise ``ValueError`` while it
+        runs yields ``{"index": i, "report": None, "error": <message>}``
+        and the stream continues with the next record. Every other record
+        yields ``error: None`` with the full report, including the
+        ``"source"``/``"target"`` stage and complete ``reports`` when a
+        check fails. Indices run continuously from 1.
+
+        ``records`` may be any iterable, including a one-shot iterator;
+        it is not consumed during the call itself. Before the result
+        iterator is returned the two rule groups are validated, the
+        revision numbers are validated and both complete snapshots are
+        read, and only then is the records iterator obtained - so an
+        illegal rule or a non-iterable ``records`` raises ``ValueError``
+        and an invalid, missing, pruned/compacted-away, unreadable or
+        corrupt revision raises ``SchemaConflict`` eagerly, without a
+        single record being consumed (an empty input is checked the same
+        way and then yields nothing). The snapshots are frozen for the
+        whole batch: a later commit, rollback, prune or compaction (the
+        anchor stays readable) cannot change a result, and the caller
+        mutating either rule list afterwards cannot either.
+
+        Each iteration consumes exactly one record - nothing is
+        prefetched - and internal retention does not grow with the
+        number of records processed. A non-``StopIteration`` exception
+        raised by the records iterator itself terminates the stream
+        unchanged, with every result already yielded retained. Input
+        records are never mutated and results are independent of the
+        inputs, the rule defaults and each other; the same inputs always
+        yield the same content in the same order. Like the other
+        migration entry points it is read-only apart from the one legacy
+        single-file migration the first snapshot read may perform.
+        """
+        # 1. Rule groups first, so an illegal rule reports before any
+        # revision is read and (importantly) before records is touched.
+        parsed_rules = _parse_migration_rules(rules)
+        with_rollback = rollback_rules is not None
+        parsed_rollback_rules = (
+            _parse_migration_rules(rollback_rules, label="rollback rule")
+            if with_rollback
+            else None
+        )
+        # 2. Revision numbers, then both complete snapshots. A conflict
+        # here propagates before records is iterated.
+        self._validate_revision_pair(old_revision, new_revision)
+        old_root, new_root, base_report = self._migration_inputs(
+            old_revision, new_revision
+        )
+        # 3. Obtain the iterator last; a non-iterable records raises
+        # ValueError here, still without consuming anything.
+        try:
+            record_iterator = iter(records)
+        except TypeError as exc:
+            raise ValueError("records must be an iterable of JSON objects") from exc
+        # Freeze the validated rule groups so later caller mutation cannot
+        # reach this batch. The snapshots in hand are already independent
+        # in-memory copies (freshly decoded, never mutated by a preview -
+        # the base report is deep-copied per record inside the helper), so
+        # a later commit, prune or compaction cannot change a result.
+        parsed_rules = copy.deepcopy(parsed_rules)
+        if parsed_rollback_rules is not None:
+            parsed_rollback_rules = copy.deepcopy(parsed_rollback_rules)
+
+        def _results() -> Iterator[dict]:
+            index = 0
+            while True:
+                # One record per iteration; ``next`` is the only consumer
+                # call. A generator's own StopIteration ends the stream
+                # (caught here so PEP 479 never turns it into a
+                # RuntimeError), while any other exception the records
+                # iterator raises propagates verbatim.
+                try:
+                    record = next(record_iterator)
+                except StopIteration:
+                    return
+                index += 1
+                try:
+                    if not isinstance(record, dict):
+                        raise ValueError("record must be a JSON object")
+                    _require_json_value(record, "record")
+                    report = _migration_preview(
+                        record,
+                        base_report,
+                        old_root,
+                        new_root,
+                        parsed_rules,
+                        parsed_rollback_rules,
+                    )
+                except ValueError as exc:
+                    yield {"index": index, "report": None, "error": str(exc)}
+                    continue
+                yield {"index": index, "report": report, "error": None}
+
+        return _results()
 
     def stats(self) -> dict:
         """Report fields, optional fields, observed types and counts.

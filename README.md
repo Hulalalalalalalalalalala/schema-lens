@@ -42,6 +42,7 @@ committed revision; without it they use the snapshot loaded at open time.
 - `compat_matrix(revisions=None) -> dict` reads committed snapshots for every revision (or a strictly increasing selection) and reports both directional verdicts for every ordered pair, self-comparisons included, in one matrix.
 - `migrate(record, old_revision, new_revision, rules) -> dict` returns the `compat` report for the pair plus a `migration` object previewing an explicit field-level migration of one JSON object: check against the old revision, apply the rename/drop/default rules in order, check against the new revision. Read-only like `compat`.
 - `migrate_roundtrip(record, old_revision, new_revision, rules, rollback_rules) -> dict` returns the full `migrate` report plus a `rollback` object, rehearsing whether the rollback rules restore the original object: rollback rules run only after the forward preview reaches `done`, the recovered record is checked against the old revision, then compared with the original key by key ignoring key order. Read-only like `migrate`.
+- `migrate_stream(records, old_revision, new_revision, rules, rollback_rules=None) -> Iterator[dict]` streams the same preview over an iterable of records (a one-shot iterator included), consuming one record per yielded result with no prefetch and bounded memory. Rules, revisions and both snapshots are validated eagerly before any record is consumed; each result is `{"index", "report", "error"}` with a continuous 1-based index. Read-only like `migrate`.
 - `stats() -> dict` reports fields, optional fields, observed types and observation counts.
 - `SchemaConflict` exported exception.
 
@@ -513,6 +514,62 @@ perform, nothing is written and the input record, both rule lists, the
 open snapshot, uncommitted batches and every committed revision are
 exactly as they were; repeating the call returns identical content and
 order.
+
+## Streaming batch preview
+
+`migrate_stream(records, old_revision, new_revision, rules,
+rollback_rules=None)` (Python only) runs the migration preview over a
+whole iterable of records and returns an iterator of per-record results:
+
+```json
+{"index": 1, "report": {"from": 1, "to": 2, "...": "...",
+                        "migration": {"stage": "done", "record": {"a": 1, "c": "x"},
+                                      "reports": []}}, "error": null}
+{"index": 2, "report": null, "error": "record must be a JSON object"}
+```
+
+Every result carries exactly `index`, `report` and `error`; indices are
+continuous from 1. With `rollback_rules` omitted `report` is the full
+`migrate` report; with a list supplied (an empty list included) it is
+the full `migrate_roundtrip` report, so the source/target stage and
+complete `reports`, approximate-branch checks, missing-vs-`null`
+semantics and the rollback difference comparison all behave exactly as
+for the single-record entries. `error` is `null` whenever a report is
+returned.
+
+A record that is not a JSON object, carries a non-JSON value, or makes a
+forward or rollback rule raise `ValueError` while it runs yields
+`report: null` with the exception message in `error`, and the stream
+continues with the next record. By contrast, a non-`StopIteration`
+exception raised by the records iterator itself terminates the stream
+unchanged, with every result already yielded retained.
+
+`records` accepts any iterable, including a one-shot iterator, and is
+not consumed during the call. The call first validates both rule
+groups, then validates the revision numbers and reads both complete
+snapshots, and only then obtains the records iterator; it returns the
+result iterator only once all of that has succeeded. An illegal rule or
+a non-iterable `records` therefore raises `ValueError`, while an
+invalid revision number or a missing, pruned/compacted-away, unreadable
+or corrupt revision raises `SchemaConflict`, in either case without
+consuming a single record. An empty input runs the same checks and
+yields nothing when they pass.
+
+Each iteration consumes exactly one record - nothing is prefetched -
+and the iterator's internal retention does not grow with the number of
+records processed. The snapshots are taken once and frozen for the
+whole batch, so a commit, rollback, prune or compaction that lands
+while the stream runs cannot affect results (a compaction anchor stays
+readable), and the caller mutating either rule list after the call
+cannot either. Input records are never modified, and a returned record
+is independent of the input, of every other result and of rule default
+values; mutating one result never affects later results. The same
+inputs always yield the same content in the same order. Apart from the
+one legacy single-file layout migration the first snapshot read may
+perform, nothing is written and the open snapshot, pending batches and
+committed history are untouched. Same-revision batches still apply the
+rules to every record, and wildcard array paths work as for
+`migrate`.
 
 ## Tests
 
