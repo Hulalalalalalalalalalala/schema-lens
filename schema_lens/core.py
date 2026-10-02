@@ -90,6 +90,18 @@ Every ordered pair, self-comparisons included, appears sorted by
 ``from`` then ``to`` with its own two directional verdicts, so upgrade and
 rollback risks sit side by side. It only reads committed snapshots, never
 infers, saves, rolls back, compacts or changes the open snapshot.
+
+``compat_witness(old, new)`` is ``compat`` plus concrete counterexamples:
+the report keeps every compat field and ordering and adds a ``witnesses``
+object with ``backward`` and ``forward`` keys. A breaking direction
+carries ``{"record": <JSON object>, "reports": [<check errors>]}`` where
+the record passes the accepting revision's ``check`` with an empty report
+and the rejecting revision's ``check`` returns exactly that complete,
+non-empty list; compatible and unknown directions (and both directions of
+a self-comparison) carry ``null``. Every witness is verified by running
+the real committed-revision checks before it is reported, so no
+counterexample is fabricated, and the analysis is read-only like
+``compat``.
 """
 
 from __future__ import annotations
@@ -869,6 +881,278 @@ def _compat_report(
     return {"from": old_revision, "to": new_revision, **report}
 
 
+# -- breaking-change witnesses ----------------------------------------------
+#
+# A witness turns a breaking verdict into something the existing ``check``
+# can verify out of hand: a concrete JSON object that the accepting
+# revision's check reports clean and that the rejecting revision's check
+# reports at least one error for. The record is built by walking the
+# accepting tree the way ``check`` walks it - every required field carries
+# one legal value, arrays carry one element per observed element kind,
+# recursively - while the rejecting tree decides which optional fields the
+# record must carry or omit to make the rejection fire. Which type branch
+# of a union carries the breaking change is asked of the same
+# ``_CompatDiffer`` that produced the verdict, so the walk invents nothing:
+# a removed field stays on the record, a newly required one is never added,
+# a dropped type keeps its value.
+#
+# Because the construction only walks branches that are really accepted, it
+# still settles a demonstrable rejection when other branches can only be
+# described approximately: such branches simply contribute no value unless
+# a required field forces one, and the exact breaking branch keeps its
+# witness. Only a verdict of breaking ever carries a witness; compatible
+# and unknown directions report null. Both halves are then run through the
+# real ``check`` before they are reported, so a witness that does not
+# verify is never handed out.
+
+
+def _witness_value(node: dict) -> Any:
+    """One concrete value accepted by one schema node.
+
+    Objects carry every required field; arrays carry one element per
+    observed element kind (empty when the schema observed no element
+    types, which check then accepts as well). Scalars use distinct fixed
+    values per kind so a boolean is never mistaken for a number and null
+    is an explicit value rather than a missing field.
+    """
+    kind = node["kind"]
+    if kind == "null":
+        return None
+    if kind == "boolean":
+        return True
+    if kind == "number":
+        return 1
+    if kind == "string":
+        return "s"
+    if kind == "array":
+        elements = node.get("elements") or {}
+        return [_witness_value(elements[k]) for k in _KINDS if k in elements]
+    record: dict[str, Any] = {}
+    if not _is_collapsed(node):
+        for name, entry in node["fields"].items():
+            if not entry["optional"]:
+                record[name] = _witness_entry(entry)
+    return record
+
+
+def _witness_entry(entry: dict) -> Any:
+    """One concrete value accepted by one field entry's type set."""
+    for kind in _KINDS:
+        child = entry["types"].get(kind)
+        if child is not None:
+            return _witness_value(child)
+    raise SchemaConflict("corrupt schema revision: field entry has no types")
+
+
+_WITNESS_OMIT = object()
+
+
+class _WitnessBuilder:
+    """Builds a check-verifiable record witnessing one breaking direction.
+
+    ``accepted`` plays the old side of a compatibility diff: its records
+    are known to be legal and the record built here must pass its check.
+    ``rejected`` plays the new side and must report the record. The walk
+    stays aligned with the two trees exactly the way
+    ``_CompatDiffer.compare_object`` aligns them.
+    """
+
+    def build(self, accepted: dict, rejected: dict) -> dict:
+        return self._object(accepted, rejected)
+
+    @staticmethod
+    def _entry_breaking(accepted: dict, rejected: dict) -> bool:
+        """Whether this paired entry demonstrably rejects an accepted value."""
+        differ = _CompatDiffer()
+        backward, _forward = differ.compare_entry(accepted, rejected, "$")
+        return backward == _BREAKING
+
+    @staticmethod
+    def _kind_breaking(kind: str, accepted: dict, rejected: dict) -> bool:
+        differ = _CompatDiffer()
+        backward, _forward = differ.compare_kind(accepted, rejected, "$")
+        return backward == _BREAKING
+
+    def _object(self, accepted: dict, rejected: dict) -> dict:
+        record: dict[str, Any] = {}
+        # A depth-capped node lets every nested value through check, so a
+        # collapsed branch can never witness a rejection. Build a value
+        # legal for the other side instead, keeping it silent here so the
+        # witness rides whichever exact branch actually breaks.
+        accepted_collapsed = _is_collapsed(accepted)
+        rejected_collapsed = _is_collapsed(rejected)
+        if accepted_collapsed:
+            return record if rejected_collapsed else _witness_value(rejected)
+        if rejected_collapsed:
+            return _witness_value(accepted)
+        rejected_fields = rejected["fields"]
+        rejected_overflow = rejected.get("overflow")
+        for name, entry in accepted["fields"].items():
+            other = rejected_fields.get(name)
+            if other is None and _overflow_routes(rejected_overflow, name):
+                # The rejecting side routes the name through its
+                # approximate overflow entry; check it against that entry.
+                other = rejected_overflow
+            if other is None:
+                # The rejecting object has no such field: carry a value the
+                # accepting side accepts so check reports it unexpected.
+                # A required field rides regardless; an optional one only
+                # witnesses when it is carried, so it is carried too.
+                record[name] = _witness_entry(entry)
+                continue
+            if entry["optional"]:
+                if not other.get("optional", False):
+                    # Accepted optional, rejected required: omit it and the
+                    # rejecting check reports the missing required field.
+                    continue
+                if not self._entry_breaking(entry, other):
+                    # A shared optional field with no breaking change
+                    # beneath it needs no value; omitting keeps the record
+                    # legal on both sides here.
+                    continue
+            value = self._entry_value(entry, other)
+            if value is _WITNESS_OMIT:
+                # A required field must carry a value for the record to
+                # pass the accepting check; fall back to any legal value.
+                value = _witness_entry(entry)
+            record[name] = value
+        return record
+
+    def _entry_value(self, accepted: dict, rejected: dict | None) -> Any:
+        """One value legal for the accepted entry, chosen to expose a break.
+
+        A field holds a single value, so among the accepted type kinds the
+        choice prefers a kind the rejecting set lacks, then a shared kind
+        whose nested branch demonstrably breaks, then any shared kind (a
+        value legal on both sides), and finally any accepted kind.
+        """
+        accepted_types = accepted["types"]
+        rejected_types = {} if rejected is None else rejected["types"]
+
+        def choose(shared_only: bool, breaking_only: bool) -> str | None:
+            for kind in _KINDS:
+                child = accepted_types.get(kind)
+                if child is None:
+                    continue
+                shared = kind in rejected_types
+                if shared_only and not shared:
+                    continue
+                if not shared_only and shared:
+                    # A dropped kind is the strongest witness and is
+                    # considered before shared kinds by the caller.
+                    continue
+                if breaking_only and not (
+                    shared and self._kind_breaking(
+                        kind, child, rejected_types[kind]
+                    )
+                ):
+                    continue
+                return kind
+            return None
+
+        kind = (
+            choose(shared_only=False, breaking_only=False)
+            or choose(shared_only=True, breaking_only=True)
+            or choose(shared_only=True, breaking_only=False)
+        )
+        if kind is None:
+            # Every accepted kind is approximate-only on the paired entry;
+            # the caller (an optional field) simply carries no value.
+            return _WITNESS_OMIT
+        return self._kind_value(
+            kind, accepted_types[kind], rejected_types.get(kind)
+        )
+
+    def _kind_value(
+        self, kind: str, accepted: dict, rejected: dict | None
+    ) -> Any:
+        if kind in ("null", "boolean", "number", "string") or rejected is None:
+            return _witness_value(accepted)
+        if kind == "object":
+            return self._object(accepted, rejected)
+        return self._array(accepted, rejected)
+
+    def _array(self, accepted: dict, rejected: dict) -> list:
+        # check walks every element against the single merged element type
+        # set, so one element per accepted element kind (in canonical kind
+        # order) covers every dropped and every nested breaking branch; an
+        # empty element set yields the empty array check accepts.
+        elements: list[Any] = []
+        for kind in _KINDS:
+            child = accepted["elements"].get(kind)
+            if child is not None:
+                elements.append(
+                    self._kind_value(
+                        kind, child, rejected["elements"].get(kind)
+                    )
+                )
+        return elements
+
+
+def _direction_witness(
+    verdict: str,
+    accepted_root: dict,
+    rejected_root: dict,
+    accepted_revision: int,
+    rejected_revision: int,
+    read_check: Any,
+) -> dict | None:
+    """The witness object for one breaking direction, else ``None``.
+
+    ``read_check(revision, record)`` runs the real ``Lens.check`` against
+    one committed snapshot, so both halves are verified with the exact
+    validation the lens exposes rather than a copy of it: the record must
+    pass the accepting revision's check and must be rejected by the
+    rejecting revision's check with the complete non-empty report list.
+    """
+    if verdict != _BREAKING:
+        return None
+    record = _WitnessBuilder().build(accepted_root, rejected_root)
+    if read_check(accepted_revision, record):
+        # Never report a counterexample the accepting revision does not
+        # accept: an approximate branch defeated the construction.
+        return None
+    reports = read_check(rejected_revision, record)
+    if not reports:
+        # The breaking verdict promised a rejection; if the constructed
+        # record happens to be accepted anyway, no witness is fabricated.
+        return None
+    return {"record": record, "reports": reports}
+
+
+def _witness_report(
+    old_revision: int,
+    new_revision: int,
+    old_root: dict,
+    new_root: dict,
+    read_check: Any,
+) -> dict:
+    """The full compat report plus verifiable breaking-change witnesses."""
+    report = _compat_report(old_revision, new_revision, old_root, new_root)
+    # Backward asks whether old-legal records are still accepted by the new
+    # revision: a breaking verdict is witnessed by a record old check
+    # accepts and new check rejects. Forward simply swaps the two roles.
+    report["witnesses"] = {
+        "backward": _direction_witness(
+            report["backward"],
+            old_root,
+            new_root,
+            old_revision,
+            new_revision,
+            read_check,
+        ),
+        "forward": _direction_witness(
+            report["forward"],
+            new_root,
+            old_root,
+            new_revision,
+            old_revision,
+            read_check,
+        ),
+    }
+    return report
+
+
 def _normalize_overflow_names(node: Any) -> None:
     """Mark pre-tracking overflow entries with explicit ``names: None``.
 
@@ -1388,6 +1672,71 @@ class Lens:
                 "unknown_reasons": [],
             }
         return _compat_report(old_revision, new_revision, old_root, new_root)
+
+    def compat_witness(self, old_revision: int, new_revision: int) -> dict:
+        """Compare two revisions and attach verifiable breaking witnesses.
+
+        The report keeps every field, value and ordering of
+        :meth:`compat` and adds one ``witnesses`` object::
+
+            "witnesses": {
+              "backward": {"record": <JSON object>, "reports": [<strings>]}
+                           | null,
+              "forward":   {"record": ..., "reports": [...]} | null,
+            }
+
+        When ``backward`` is ``breaking`` its witness ``record`` is a JSON
+        object the old revision's :meth:`check` accepts (an empty report
+        list) and the new revision's check rejects with exactly the
+        complete, non-empty report list in ``reports``; when ``forward``
+        is breaking the old and new roles swap. A ``compatible`` or
+        ``unknown`` direction carries ``null``, and a self-comparison
+        carries ``null`` in both directions. No witness is fabricated for
+        a direction that is not demonstrably breaking.
+
+        Both snapshots are read and fully validated from disk and each
+        witness is verified by running the real check against the two
+        committed revisions; the open snapshot, memory, pending inference
+        batches and every committed revision are left untouched. A
+        missing, pruned/compacted-away or corrupt revision, or a
+        non-integer, boolean or non-positive revision number raises
+        ``SchemaConflict``. Repeating the analysis of the same pair
+        returns content-, key-order-, report- and stdout-byte-identical
+        JSON.
+        """
+        if (
+            isinstance(old_revision, bool)
+            or not isinstance(old_revision, int)
+            or old_revision < 1
+            or isinstance(new_revision, bool)
+            or not isinstance(new_revision, int)
+            or new_revision < 1
+        ):
+            raise SchemaConflict(
+                f"unknown schema revision: {old_revision!r}, {new_revision!r}"
+            )
+        old_root = self._read_revision(old_revision)
+        new_root = self._read_revision(new_revision)
+        if old_revision == new_revision:
+            # Mirror compat's self-comparison exactly, with both
+            # witnesses null: a revision accepts its own records and no
+            # counterexample exists in either direction.
+            return {
+                "from": old_revision,
+                "to": new_revision,
+                "backward": _COMPATIBLE,
+                "forward": _COMPATIBLE,
+                "changes": [],
+                "unknown_reasons": [],
+                "witnesses": {"backward": None, "forward": None},
+            }
+
+        def read_check(revision: int, record: Any) -> list[str]:
+            return self.check(record, version=revision)
+
+        return _witness_report(
+            old_revision, new_revision, old_root, new_root, read_check
+        )
 
     def compat_matrix(self, revisions: list[int] | tuple[int, ...] | None = None) -> dict:
         """Compare every ordered pair of committed revisions both ways.

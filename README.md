@@ -21,6 +21,7 @@ Python 3.11 or newer. Standard library only.
     python3 -m schema_lens --path ./lens status
     python3 -m schema_lens --path ./lens compat <old-revision> <new-revision>
     python3 -m schema_lens --path ./lens matrix [--revisions 1,2,3]
+    python3 -m schema_lens --path ./lens witness <old-revision> <new-revision>
 
 `check` and `show` accept `--version <revision>` to target one specific
 committed revision; without it they use the snapshot loaded at open time.
@@ -37,6 +38,7 @@ committed revision; without it they use the snapshot loaded at open time.
 - `compact(*, keep=None, background=False) -> dict | None` merges the oldest history segment into one baseline version and returns `{"anchor": ..., "merged": [...]}` (or `None` when the history is already within the keep bound).
 - `compaction_status() -> dict` reports the committed baseline, the revisions merged into it, the live logical history and any background run in progress.
 - `compat(old_revision, new_revision) -> dict` reads two committed snapshots and reports how the evolution between them affects records legal under each side, without changing memory or any revision.
+- `compat_witness(old_revision, new_revision) -> dict` returns the same report as `compat`, field for field and in the same order, plus a `witnesses` object attaching a concrete, check-verifiable counterexample to each breaking direction.
 - `compat_matrix(revisions=None) -> dict` reads committed snapshots for every revision (or a strictly increasing selection) and reports both directional verdicts for every ordered pair, self-comparisons included, in one matrix.
 - `stats() -> dict` reports fields, optional fields, observed types and observation counts.
 - `SchemaConflict` exported exception.
@@ -281,6 +283,80 @@ A missing, pruned/compacted-away or corrupt revision raises
 fewer or more than two revision numbers is an argument error (`2`, no
 report). A completed analysis exits `0` even when a verdict is `breaking`
 or `unknown`.
+
+## Breaking-change witnesses
+
+`compat_witness(old, new)` (command: `witness <old-revision>
+<new-revision>`) answers the natural follow-up to a breaking verdict:
+what is one concrete record the existing `check` actually rejects, and
+why? It keeps every field, value and ordering of the `compat` report and
+adds exactly one `witnesses` object:
+
+```json
+{
+  "from": 1,
+  "to": 2,
+  "backward": "compatible",
+  "forward": "breaking",
+  "changes": [
+    {"path": "$.b", "change": "field_added", "breaking": false}
+  ],
+  "unknown_reasons": [],
+  "witnesses": {
+    "backward": null,
+    "forward": {
+      "record": {"a": 1, "b": "s"},
+      "reports": ["$.b: unexpected field"]
+    }
+  }
+}
+```
+
+Each direction is witnessed independently. When `backward` is
+`breaking`, `record` is a JSON object that passes the **old**
+`check(record, version=old)` with an empty report list and
+`reports` is the complete, non-empty list `check(record, version=new)`
+returns for it; when `forward` is breaking the old and new roles swap. A
+`compatible` or `unknown` direction carries `null`, and a
+self-comparison carries `null` in both directions. Both halves are run
+through the real committed-revision `check` before the report is
+returned, so a witness always verifies out of hand and no counterexample
+is ever fabricated for a direction that is only `unknown`.
+
+The record is built from the accepting schema, not stored from
+inference, so the analysis needs no original records. Required fields
+are present with legal values; a field removed on the rejecting side is
+simply carried and reported as unexpected; a newly required field is
+omitted and reported missing; a dropped type keeps a value of that type.
+A boolean is never used where a number is meant (`true` produces
+`type boolean not in field types [number]`), an explicit `null` stays
+distinct from a missing field, and an empty array follows the usual
+check semantics (it carries no element types, so it accepts no
+elements). Nested objects, objects inside array elements and multiple
+array levels recurse with the same `[]`/index path notation `check`
+uses. Field names containing dots, backslashes or asterisks keep their
+real key names in `record`, and the error paths quote them exactly as
+`check` does (`$["a.b"]`, `$["a\\b"]`, `$["*"]`).
+
+When one branch can only be described approximately (an overflow entry
+or a depth-capped subtree) but an exact breaking change is proved
+elsewhere, the breaking direction still carries a verifiable witness
+riding the exact branch while the approximate branch stays silent; a
+pair whose every relevant branch is unknown reports `null` witnesses.
+Repeating the analysis of the same pair returns content-, key-order-,
+report-list- and stdout-byte-identical JSON.
+
+Like `compat`, the analysis is strictly read-only: it reads and
+validates committed snapshots (baseline anchors included; old
+single-file lenses are migrated using the existing read rules) and
+never changes the open snapshot, an unsaved inference batch or any
+version history. Non-integer, boolean or non-positive revision numbers,
+and missing, pruned/compacted-away or corrupt revisions raise
+`SchemaConflict`; the command exits `2` with an empty stdout (the
+message goes to stderr) for argument and analysis errors alike, and
+exits `0` with only the report JSON on success, including `breaking` or
+`unknown` conclusions. `compat` and `matrix` keep emitting their
+original reports unchanged.
 
 ## Cross-version compatibility matrix
 

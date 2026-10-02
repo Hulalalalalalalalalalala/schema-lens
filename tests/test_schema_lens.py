@@ -3016,6 +3016,591 @@ class CompatMatrixCliTests(unittest.TestCase):
         self.assertEqual(code, 2)
 
 
+class CompatWitnessTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.lens = Lens(self.dir.name)
+
+    def _publish_pair(self, old_records, new_records, **limits):
+        _publish(self.dir.name, old_records, 1, **limits)
+        _publish(self.dir.name, new_records, 2, **limits)
+        return self.lens.compat_witness(1, 2)
+
+    def _assert_verified(self, report, old=1, new=2):
+        # The compat half is exactly the compat report, field by field.
+        compat = self.lens.compat(old, new)
+        for key in ("from", "to", "backward", "forward", "changes",
+                    "unknown_reasons"):
+            self.assertEqual(report[key], compat[key])
+        self.assertEqual(
+            set(report),
+            {"from", "to", "backward", "forward", "changes",
+             "unknown_reasons", "witnesses"},
+        )
+        witnesses = report["witnesses"]
+        self.assertEqual(set(witnesses), {"backward", "forward"})
+        for direction, accepted, rejected in (
+            ("backward", old, new),
+            ("forward", new, old),
+        ):
+            witness = witnesses[direction]
+            if report[direction] != "breaking":
+                self.assertIsNone(witness, direction)
+                continue
+            self.assertIsNotNone(witness, direction)
+            self.assertEqual(set(witness), {"record", "reports"})
+            self.assertIsInstance(witness["record"], dict)
+            # The record passes the accepting revision's check...
+            self.assertEqual(
+                self.lens.check(witness["record"], version=accepted), []
+            )
+            # ...and the reports are the complete, non-empty list the
+            # rejecting revision's own check returns for it.
+            reports = self.lens.check(witness["record"], version=rejected)
+            self.assertTrue(reports)
+            self.assertEqual(witness["reports"], reports)
+
+    def test_report_keeps_every_compat_field_and_adds_witnesses(self):
+        report = self._publish_pair([{"a": 1}], [{"a": 2, "b": "x"}, {"a": 3}])
+        self.assertEqual(
+            set(report),
+            {"from", "to", "backward", "forward", "changes",
+             "unknown_reasons", "witnesses"},
+        )
+        self._assert_verified(report)
+
+    def test_self_comparison_carries_two_null_witnesses(self):
+        _publish(self.dir.name, [{"a": 1, "b": 2}], 1)
+        report = self.lens.compat_witness(1, 1)
+        self.assertEqual(report["backward"], "compatible")
+        self.assertEqual(report["forward"], "compatible")
+        self.assertEqual(report["changes"], [])
+        self.assertEqual(report["unknown_reasons"], [])
+        self.assertEqual(
+            report["witnesses"], {"backward": None, "forward": None}
+        )
+
+    def test_backward_breaking_narrows_type_set(self):
+        report = self._publish_pair(
+            [{"a": 1}, {"a": "s"}], [{"a": 2}, {"a": 3}]
+        )
+        self.assertEqual(report["backward"], "breaking")
+        self.assertEqual(report["forward"], "compatible")
+        witness = report["witnesses"]["backward"]
+        self.assertIsNone(report["witnesses"]["forward"])
+        self.assertEqual(witness["record"], {"a": "s"})
+        self.assertEqual(
+            witness["reports"],
+            ["$.a: type string not in field types [number]"],
+        )
+        self._assert_verified(report)
+
+    def test_forward_breaking_adds_optional_field(self):
+        report = self._publish_pair(
+            [{"a": 1}, {"a": 2}], [{"a": 3, "b": "x"}, {"a": 4}]
+        )
+        self.assertEqual(report["backward"], "compatible")
+        self.assertEqual(report["forward"], "breaking")
+        self.assertIsNone(report["witnesses"]["backward"])
+        witness = report["witnesses"]["forward"]
+        self.assertEqual(witness["record"], {"a": 1, "b": "s"})
+        self.assertEqual(witness["reports"], ["$.b: unexpected field"])
+
+    def test_add_required_field_breaks_both_directions(self):
+        report = self._publish_pair(
+            [{"a": 1}], [{"a": 2, "b": "x"}, {"a": 3, "b": "y"}]
+        )
+        self.assertEqual(report["backward"], "breaking")
+        self.assertEqual(report["forward"], "breaking")
+        # Backward: an old record omits the newly required field.
+        self.assertEqual(
+            report["witnesses"]["backward"]["record"], {"a": 1}
+        )
+        self.assertEqual(
+            report["witnesses"]["backward"]["reports"],
+            ["$.b: missing required field"],
+        )
+        # Forward: a new record carrying it is unexpected to old check.
+        self.assertEqual(
+            report["witnesses"]["forward"]["record"], {"a": 1, "b": "s"}
+        )
+        self.assertEqual(
+            report["witnesses"]["forward"]["reports"],
+            ["$.b: unexpected field"],
+        )
+        self._assert_verified(report)
+
+    def test_remove_field_witnesses_carried_value(self):
+        report = self._publish_pair(
+            [{"a": 1, "b": "x"}, {"a": 2}], [{"a": 3}, {"a": 4}]
+        )
+        witness = report["witnesses"]["backward"]
+        self.assertEqual(witness["record"], {"a": 1, "b": "s"})
+        self.assertEqual(witness["reports"], ["$.b: unexpected field"])
+        self._assert_verified(report)
+
+    def test_optional_becomes_required_witnesses_an_omission(self):
+        report = self._publish_pair(
+            [{"a": 1, "b": "x"}, {"a": 2}],
+            [{"a": 3, "b": "x"}, {"a": 4, "b": "y"}],
+        )
+        self.assertEqual(report["backward"], "breaking")
+        witness = report["witnesses"]["backward"]
+        self.assertNotIn("b", witness["record"])
+        self.assertEqual(
+            witness["reports"], ["$.b: missing required field"]
+        )
+        self._assert_verified(report)
+
+    def test_required_becomes_optional_witnesses_new_record(self):
+        report = self._publish_pair(
+            [{"a": 1, "b": "x"}, {"a": 2, "b": "y"}],
+            [{"a": 3, "b": "x"}, {"a": 4}],
+        )
+        witness = report["witnesses"]["forward"]
+        self.assertNotIn("b", witness["record"])
+        self.assertEqual(
+            witness["reports"], ["$.b: missing required field"]
+        )
+        self._assert_verified(report)
+
+    def test_boolean_is_never_used_as_a_number_witness(self):
+        report = self._publish_pair(
+            [{"a": True}, {"a": False}], [{"a": 1}]
+        )
+        witness = report["witnesses"]["backward"]
+        self.assertIs(witness["record"]["a"], True)
+        self.assertEqual(
+            witness["reports"],
+            ["$.a: type boolean not in field types [number]"],
+        )
+
+    def test_null_value_is_explicit_not_a_missing_field(self):
+        report = self._publish_pair([{"a": None}], [{"a": 1}])
+        witness = report["witnesses"]["backward"]
+        self.assertIn("a", witness["record"])
+        self.assertIsNone(witness["record"]["a"])
+        self.assertEqual(
+            witness["reports"],
+            ["$.a: type null not in field types [number]"],
+        )
+
+    def test_nested_object_breaking_branch(self):
+        report = self._publish_pair(
+            [{"user": {"x": 1, "y": "s"}}],
+            [{"user": {"x": 2}}],
+        )
+        witness = report["witnesses"]["backward"]
+        self.assertEqual(witness["record"], {"user": {"x": 1, "y": "s"}})
+        self.assertEqual(
+            witness["reports"],
+            ["$.user.y: unexpected field"],
+        )
+        self._assert_verified(report)
+
+    def test_nested_required_field_added_inside_element_object(self):
+        report = self._publish_pair(
+            [{"items": [{"x": 1}]}],
+            [{"items": [{"x": 2, "y": 9}]}],
+        )
+        witness = report["witnesses"]["backward"]
+        self.assertEqual(witness["record"], {"items": [{"x": 1}]})
+        self.assertEqual(
+            witness["reports"],
+            ["$.items[0].y: missing required field"],
+        )
+        self._assert_verified(report)
+
+    def test_array_element_kind_change_reports_index_zero(self):
+        report = self._publish_pair(
+            [{"tags": ["a", 1]}], [{"tags": ["b", "c"]}]
+        )
+        witness = report["witnesses"]["backward"]
+        # One element per accepted element kind, in canonical kind order:
+        # number first, so the dropped number branch is the rejected one.
+        self.assertEqual(witness["record"], {"tags": [1, "s"]})
+        self.assertEqual(
+            witness["reports"],
+            ["$.tags[0]: type number not in field types [string]"],
+        )
+        self._assert_verified(report)
+
+    def test_multiple_array_levels(self):
+        report = self._publish_pair(
+            [{"m": [[1, 2], ["a"]]}],
+            [{"m": [[3]]}],
+        )
+        witness = report["witnesses"]["backward"]
+        # The outer array's one (array-kind) element carries one element
+        # per accepted inner kind: number then string; the string inner
+        # element is absent from the narrowed inner type set.
+        self.assertEqual(witness["record"], {"m": [[1, "s"]]})
+        self.assertEqual(
+            witness["reports"],
+            ["$.m[0][1]: type string not in field types [number]"],
+        )
+        self._assert_verified(report)
+
+    def test_array_element_object_narrows(self):
+        report = self._publish_pair(
+            [{"items": [{"x": 1}, {"x": "s"}]}],
+            [{"items": [{"x": 2}, {"x": 3}]}],
+        )
+        witness = report["witnesses"]["backward"]
+        self.assertEqual(witness["record"], {"items": [{"x": "s"}]})
+        self.assertEqual(
+            witness["reports"],
+            ["$.items[0].x: type string not in field types [number]"],
+        )
+
+    def test_empty_array_follows_check_semantics_both_directions(self):
+        # An empty array observed on one side contributes no element types,
+        # so a populated array from the other side fails its elements; an
+        # empty array itself stays legal everywhere.
+        report = self._publish_pair([{"tags": []}], [{"tags": ["a"]}])
+        self.assertEqual(report["backward"], "compatible")
+        self.assertEqual(report["forward"], "breaking")
+        forward = report["witnesses"]["forward"]
+        self.assertEqual(forward["record"], {"tags": ["s"]})
+        self.assertEqual(
+            forward["reports"],
+            ["$.tags[0]: type string not in field types []"],
+        )
+        # An empty record-array value witnesses nothing: it passes both.
+        self.assertEqual(self.lens.check({"tags": []}, version=1), [])
+        self.assertEqual(self.lens.check({"tags": []}, version=2), [])
+        report = self._publish_pair([{"tags": ["a"]}], [{"tags": []}])
+        backward = report["witnesses"]["backward"]
+        self.assertEqual(backward["record"], {"tags": ["s"]})
+        self.assertEqual(
+            backward["reports"],
+            ["$.tags[0]: type string not in field types []"],
+        )
+
+    def test_dotted_backslash_and_star_keys_keep_real_names(self):
+        report = self._publish_pair(
+            [{"a.b": 1, "a\\b": 2, "*": 3}],
+            [{"other": 9}],
+        )
+        witness = report["witnesses"]["backward"]
+        self.assertEqual(
+            set(witness["record"]), {"a.b", "a\\b", "*"}
+        )
+        self.assertEqual(witness["record"]["a.b"], 1)
+        self.assertEqual(witness["record"]["a\\b"], 1)
+        self.assertEqual(witness["record"]["*"], 1)
+        self.assertEqual(
+            sorted(witness["reports"]),
+            sorted([
+                '$["*"]: unexpected field',
+                '$["a.b"]: unexpected field',
+                '$["a\\\\b"]: unexpected field',
+                "$.other: missing required field",
+            ]),
+        )
+        self._assert_verified(report)
+
+    def test_unknown_only_pair_carries_no_witnesses(self):
+        _publish(self.dir.name, [{"a": 1, "b": 2}], 1, max_fields=1)
+        _publish(self.dir.name, [{"a": 3, "c": 4}], 2, max_fields=1)
+        report = self.lens.compat_witness(1, 2)
+        self.assertEqual(report["backward"], "unknown")
+        self.assertEqual(report["forward"], "unknown")
+        self.assertEqual(
+            report["witnesses"], {"backward": None, "forward": None}
+        )
+
+    def test_depth_capped_only_pair_carries_no_witnesses(self):
+        _publish(self.dir.name, [{"u": {"k": {"deep": 1}}}], 1,
+                 max_depth=1)
+        _publish(self.dir.name, [{"u": {"k": {"other": 2}}}], 2,
+                 max_depth=1)
+        report = self.lens.compat_witness(1, 2)
+        self.assertEqual(report["backward"], "unknown")
+        self.assertEqual(
+            report["witnesses"], {"backward": None, "forward": None}
+        )
+
+    def test_approximate_branch_elsewhere_still_witnesses_break(self):
+        _publish(
+            self.dir.name,
+            [{"a": 1, "b": 2, "x": 1}], 1, max_fields=2,
+        )
+        _publish(
+            self.dir.name,
+            [{"a": 3, "c": 4, "x": "s"}], 2, max_fields=2,
+        )
+        report = self.lens.compat_witness(1, 2)
+        self.assertEqual(report["backward"], "breaking")
+        self.assertEqual(report["forward"], "breaking")
+        self.assertIn("$.*", report["unknown_reasons"])
+        self._assert_verified(report)
+
+    def test_depth_capped_sibling_still_witnesses_exact_break(self):
+        _publish(
+            self.dir.name,
+            [{"u": {"k": {"deep": 1}}, "x": 1}], 1, max_depth=1,
+        )
+        _publish(
+            self.dir.name,
+            [{"u": {"k": {"deep": 2}}, "x": "s"}], 2, max_depth=1,
+        )
+        report = self.lens.compat_witness(1, 2)
+        self.assertEqual(report["backward"], "breaking")
+        self.assertEqual(report["forward"], "breaking")
+        backward = report["witnesses"]["backward"]
+        # The collapsed branch contributes no rejection of its own; the
+        # exact type narrowing at $.x is what the reports name.
+        self.assertEqual(
+            backward["reports"],
+            ["$.x: type number not in field types [string]"],
+        )
+        self._assert_verified(report)
+
+    def test_repeated_analysis_is_fully_stable(self):
+        _publish(self.dir.name, [{"a": 1, "z": 1, "n": None}], 1)
+        _publish(self.dir.name, [{"a": "s", "m": 2}], 2)
+        first = self.lens.compat_witness(1, 2)
+        for _ in range(3):
+            self.assertEqual(self.lens.compat_witness(1, 2), first)
+        reversed_report = self.lens.compat_witness(2, 1)
+        for _ in range(2):
+            self.assertEqual(self.lens.compat_witness(2, 1), reversed_report)
+
+    def test_reports_list_is_the_complete_check_output(self):
+        # Several fields removed at once: every removal appears.
+        report = self._publish_pair(
+            [{"a": 1, "b": "x", "c": True}],
+            [{"a": 2, "d": None}],
+        )
+        reports = report["witnesses"]["backward"]["reports"]
+        self.assertEqual(
+            sorted(reports),
+            sorted([
+                "$.b: unexpected field",
+                "$.c: unexpected field",
+                "$.d: missing required field",
+            ]),
+        )
+        self._assert_verified(report)
+
+    def test_analysis_does_not_change_snapshot_batches_or_history(self):
+        _publish(self.dir.name, [{"a": 1}], 1)
+        _publish(self.dir.name, [{"a": 2, "b": "x"}], 2)
+        reader = Lens(self.dir.name)
+        reader.load(version=1)
+        reader.infer([{"pending": "record"}])
+        before = reader.schema()
+        self.lens.compat_witness(1, 2)
+        reader.compat_witness(1, 2)
+        self.assertEqual(reader.schema(), before)
+        self.assertEqual(reader.versions(), [1, 2])
+
+    def test_lens_without_any_load_can_still_analyse(self):
+        _publish(self.dir.name, [{"a": 1}], 1)
+        _publish(self.dir.name, [{"a": 2, "b": "x"}], 2)
+        unopened = Lens(self.dir.name)
+        report = unopened.compat_witness(1, 2)
+        self.assertEqual(report["forward"], "breaking")
+        self.assertIsNone(unopened._schema)
+
+    def test_compacted_baseline_anchor_is_a_valid_input(self):
+        lens = Lens(self.dir.name, compact_keep=1)
+        for index in range(4):
+            lens.infer([{f"f{index}": index}])
+            lens.save()
+        lens.compact()
+        anchor, tail = lens.versions()
+        report = lens.compat_witness(anchor, tail)
+        self._assert_verified(report, old=anchor, new=tail)
+        with self.assertRaises(SchemaConflict):
+            lens.compat_witness(1, 4)
+
+    def test_missing_pruned_or_corrupt_revision_raises(self):
+        _publish(self.dir.name, [{"a": 1}], 1)
+        with self.assertRaises(SchemaConflict):
+            self.lens.compat_witness(1, 2)
+        with self.assertRaises(SchemaConflict):
+            self.lens.compat_witness(9, 10)
+        _publish(self.dir.name, [{"a": 2}], 2)
+        revision_path(self.dir.name, 2).write_text(
+            "{broken", encoding="utf-8"
+        )
+        with self.assertRaises(SchemaConflict):
+            self.lens.compat_witness(1, 2)
+
+    def test_invalid_revision_arguments_raise_schema_conflict(self):
+        _publish(self.dir.name, [{"a": 1}], 1)
+        for bad in (
+            (0, 1), (1, 0), (-1, 2), (True, 1), (1, False),
+            (1.0, 2), (2, 1.5), ("1", 2), (1, "2"),
+        ):
+            with self.assertRaises(SchemaConflict):
+                self.lens.compat_witness(*bad)
+
+
+class CompatWitnessCliTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.lens_dir = str(Path(self.dir.name, "lens"))
+        self.records = str(Path(self.dir.name, "records.jsonl"))
+
+    def _write(self, records):
+        with open(self.records, "w", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(json.dumps(record) + "\n")
+
+    def _run(self, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        import contextlib
+        with redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = cli_main(list(argv))
+        return code, out.getvalue(), err.getvalue()
+
+    def _commit(self, records):
+        self._write(records)
+        code, _, _ = self._run(
+            "--path", self.lens_dir, "infer", self.records
+        )
+        self.assertEqual(code, 0)
+
+    def test_witness_outputs_json_report(self):
+        self._commit([{"a": 1}])
+        self._commit([{"a": 2, "b": "x"}, {"a": 3}])
+        code, out, err = self._run(
+            "--path", self.lens_dir, "witness", "1", "2"
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+        report = json.loads(out)
+        self.assertEqual(
+            set(report),
+            {"from", "to", "backward", "forward", "changes",
+             "unknown_reasons", "witnesses"},
+        )
+        self.assertTrue(out.endswith("\n"))
+        witness = report["witnesses"]["forward"]
+        self.assertEqual(witness["record"], {"a": 1, "b": "s"})
+        self.assertEqual(witness["reports"], ["$.b: unexpected field"])
+        self.assertIsNone(report["witnesses"]["backward"])
+
+    def test_self_comparison_exits_zero_with_null_witnesses(self):
+        self._commit([{"a": 1}])
+        code, out, _ = self._run(
+            "--path", self.lens_dir, "witness", "1", "1"
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            json.loads(out)["witnesses"],
+            {"backward": None, "forward": None},
+        )
+
+    def test_breaking_and_unknown_both_exit_zero(self):
+        self._commit([{"a": 1}])
+        self._commit([{"a": "s"}])
+        code, _, _ = self._run(
+            "--path", self.lens_dir, "witness", "1", "2"
+        )
+        self.assertEqual(code, 0)
+        # Recreate the lens directory with an overflow pair for the
+        # unknown case (overflow needs both revisions folded capped).
+        shutil = __import__("shutil")
+        shutil.rmtree(self.lens_dir, ignore_errors=True)
+        self._write([{"a": 1, "b": 2}])
+        code, _, _ = self._run(
+            "--path", self.lens_dir, "--max-fields", "1",
+            "infer", self.records,
+        )
+        self.assertEqual(code, 0)
+        self._write([{"a": 3, "c": 4}])
+        code, _, _ = self._run(
+            "--path", self.lens_dir, "--max-fields", "1",
+            "infer", self.records,
+        )
+        self.assertEqual(code, 0)
+        code, out, _ = self._run(
+            "--path", self.lens_dir, "witness", "1", "2"
+        )
+        self.assertEqual(code, 0)
+        report = json.loads(out)
+        self.assertEqual(report["backward"], "unknown")
+        self.assertEqual(
+            report["witnesses"], {"backward": None, "forward": None}
+        )
+
+    def test_argument_errors_exit_two_with_empty_stdout(self):
+        self._commit([{"a": 1}])
+        for argv in (
+            ("witness",),
+            ("witness", "1"),
+            ("witness", "1", "2", "3"),
+            ("witness", "abc", "2"),
+            ("witness", "1", "2.0"),
+        ):
+            code, out, err = self._run("--path", self.lens_dir, *argv)
+            self.assertEqual(code, 2, argv)
+            self.assertEqual(out, "", argv)
+            self.assertNotEqual(err, "", argv)
+
+    def test_missing_revision_exits_two_with_empty_stdout(self):
+        self._commit([{"a": 1}])
+        code, out, err = self._run(
+            "--path", self.lens_dir, "witness", "1", "9"
+        )
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+        self.assertNotEqual(err, "")
+
+    def test_output_bytes_are_stable(self):
+        self._commit([{"a": 1, "n": None}])
+        self._commit([{"a": "s", "b": "x"}])
+        _, first, _ = self._run(
+            "--path", self.lens_dir, "witness", "1", "2"
+        )
+        for _ in range(2):
+            _, again, _ = self._run(
+                "--path", self.lens_dir, "witness", "1", "2"
+            )
+            self.assertEqual(again, first)
+
+    def test_version_flag_rejected(self):
+        self._commit([{"a": 1}])
+        code, out, _ = self._run(
+            "--path", self.lens_dir, "--version", "1",
+            "witness", "1", "1",
+        )
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+
+    def test_witness_does_not_change_versions(self):
+        self._commit([{"a": 1}])
+        self._commit([{"a": 2}])
+        self._run("--path", self.lens_dir, "witness", "1", "2")
+        code, out, _ = self._run("--path", self.lens_dir, "versions")
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out), [1, 2])
+
+    def test_compat_and_matrix_reports_are_unchanged(self):
+        self._commit([{"a": 1}])
+        self._commit([{"a": 2, "b": "x"}])
+        code, compat_out, _ = self._run(
+            "--path", self.lens_dir, "compat", "1", "2"
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            set(json.loads(compat_out)),
+            {"from", "to", "backward", "forward", "changes",
+             "unknown_reasons"},
+        )
+        code, matrix_out, _ = self._run(
+            "--path", self.lens_dir, "matrix"
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(set(json.loads(matrix_out)), {"revisions", "pairs"})
+
+
 if __name__ == "__main__":
     unittest.main()
 
