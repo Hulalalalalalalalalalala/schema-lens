@@ -187,6 +187,30 @@ the stream continues, while any other iterator exception propagates
 unchanged. Snapshots and rules are frozen for the batch and the
 preview is read-only apart from the one legacy layout migration a
 first read may perform.
+
+``migrate_path_stream`` also accepts an optional ``rollback_rule_groups``
+keyword: a JSON array with one rule array per segment (group ``i``
+belongs to forward segment ``i``, so its length equals the segment
+count). The reports then carry two extra keys, ``rollback_steps`` and
+``rollback``. When the forward path fully reaches ``"done"`` the
+rollback rehearsal runs the segments in reverse path order from the
+endpoint record - segment ``N`` migrating the record from
+``revisions[N]`` back to ``revisions[N-1]`` with its own rollback group
+in that group's order, through the same source-check/rules/target-check
+pipeline - and collects each reverse segment's complete migrate report
+in ``rollback_steps``. The first reverse segment stopping at ``source``
+or ``target`` is kept, stops the rehearsal and gives ``rollback`` that
+stage with a null record, the full check list and empty differences;
+when every reverse segment succeeds the recovered record is compared
+with the original record under ``migrate_roundtrip``'s difference
+semantics and ``rollback`` is ``"done"`` or ``"different"``. A forward
+path that stops early yields ``rollback_steps: []`` and
+``rollback: null``. All forward and rollback rule groups are validated
+together before any revision is read; a rule ``ValueError`` during a
+reverse segment becomes a per-record error prefixed ``"rollback step
+N: "`` with N the 1-based number of the matching forward segment.
+Omitting the keyword (or passing ``None``) leaves the output exactly as
+before.
 """
 
 from __future__ import annotations
@@ -1590,6 +1614,7 @@ def _path_migration_preview(
     record: dict,
     endpoint_report: dict,
     segments: list[tuple[dict, dict, list[dict], dict]],
+    rollback_segments: list[tuple[int, dict, dict, list[dict], dict]] | None = None,
 ) -> dict:
     """Preview one record through an ordered sequence of migration segments.
 
@@ -1607,6 +1632,24 @@ def _path_migration_preview(
     structural ``ValueError`` raised while segment ``N`` (1-based) runs is
     re-raised prefixed with ``"step N: "``; an invalid record is rejected
     by the caller before this helper runs.
+
+    With ``rollback_segments`` given, a forward path that fully reaches
+    ``"done"`` is followed by a rollback rehearsal: each entry is
+    ``(forward_step_number, old_root, new_root, rules, base_report)`` for
+    one reverse segment, listed in execution (reverse path) order, and
+    the segment migrates the previous segment's recovered record from
+    ``revisions[N]`` back to ``revisions[N-1]`` with the same
+    source-check/rules/target-check pipeline. The report then also
+    carries ``rollback_steps`` (the complete migrate report of every
+    reverse segment attempted, in execution order) and ``rollback`` -
+    ``None`` when the forward path stopped early, otherwise the same
+    object shape ``migrate_roundtrip`` produces: the first failing
+    segment's stage with a null record, its full check list and empty
+    differences, or, once every reverse segment passed, the recovered
+    record compared against the original with ``stage`` ``"done"`` or
+    ``"different"``. A structural ``ValueError`` from a reverse segment
+    is re-raised prefixed with ``"rollback step N: "``, N being the
+    1-based number of the matching forward segment.
     """
     report = copy.deepcopy(endpoint_report)
     steps: list[dict] = []
@@ -1626,6 +1669,50 @@ def _path_migration_preview(
         current = migrated
     report["steps"] = steps
     report["migration"] = copy.deepcopy(steps[-1]["migration"])
+    if rollback_segments is None:
+        return report
+    rollback_steps: list[dict] = []
+    rollback: dict | None = None
+    # The rehearsal only runs when every forward segment reached "done";
+    # then ``current`` is the endpoint record the last segment produced.
+    if len(steps) == len(segments) and steps[-1]["migration"]["stage"] == "done":
+        recovered = current
+        for forward_number, old_root, new_root, rules, base_report in (
+            rollback_segments
+        ):
+            try:
+                step_report, migrated = _forward_migration(
+                    base_report, recovered, old_root, new_root, rules
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    f"rollback step {forward_number}: {exc}"
+                ) from exc
+            rollback_steps.append(step_report)
+            stage = step_report["migration"]["stage"]
+            if stage != "done":
+                # Keep the failing segment and stop; the remaining
+                # reverse segments never run.
+                rollback = {
+                    "stage": stage,
+                    "record": None,
+                    "reports": list(step_report["migration"]["reports"]),
+                    "differences": [],
+                }
+                break
+            recovered = migrated
+        else:
+            differences = _structural_diff_paths(record, recovered)
+            rollback = {
+                "stage": "different" if differences else "done",
+                # A private copy, like the top-level ``migration`` object,
+                # so the report's parts share no mutable state.
+                "record": copy.deepcopy(recovered),
+                "reports": [],
+                "differences": differences,
+            }
+    report["rollback_steps"] = rollback_steps
+    report["rollback"] = rollback
     return report
 
 
@@ -2571,6 +2658,7 @@ class Lens:
         records: Iterable[Any],
         revisions: Any,
         rule_groups: Any,
+        rollback_rule_groups: Any = None,
     ) -> Iterator[dict]:
         """Stream a multi-revision migration path preview over records.
 
@@ -2606,16 +2694,52 @@ class Lens:
         ``"step N: <message>"`` (N counts from 1) and the stream
         continues with the next record.
 
+        With ``rollback_rule_groups`` left as ``None`` the report ends
+        there. Passing a JSON array - one rule array per segment, group
+        ``i`` belonging to forward segment ``i``, so its length is
+        exactly ``len(revisions) - 1`` - additionally rehearses the
+        rollback of the whole path and the report also carries::
+
+            "rollback_steps": [<the complete migrate report of every
+                                reverse segment attempted, in execution
+                                order>],
+            "rollback": {"stage": ..., "record": ..., "reports": [...],
+                         "differences": [...]} | None,
+
+        When the forward path does not fully reach ``"done"``,
+        ``rollback_steps`` is ``[]`` and ``rollback`` is ``None``.
+        Otherwise the rehearsal starts from the endpoint record and runs
+        the segments in reverse path order, each group in its own order,
+        segment ``N`` migrating the record from ``revisions[N]`` back to
+        ``revisions[N-1]`` through the ordinary
+        source-check/rules/target-check pipeline (a same-version segment
+        included). The first reverse segment whose source or target
+        check fails is kept in ``rollback_steps``, stops the rehearsal,
+        and ``rollback`` takes that segment's stage with ``record``
+        ``None``, the complete check report list and empty
+        ``differences``. When every reverse segment succeeds, the
+        recovered record is compared with the original record exactly
+        like :meth:`migrate_roundtrip` compares (key order ignored,
+        missing distinct from null, booleans distinct from numbers, ints
+        and floats by numeric value, differing paths de-duplicated and
+        sorted): ``stage`` is ``"done"`` with empty ``differences`` when
+        they are equal and ``"different"`` otherwise. A rule raising
+        ``ValueError`` during a reverse segment yields ``report: None``
+        with the rule error as ``"rollback step N: <message>"``, N being
+        the 1-based number of the matching forward segment, and the
+        stream continues with the next record.
+
         Before the iterator is returned the path containers and every
-        rule group are validated (a non-array, a length mismatch or an
-        illegal rule raises ``ValueError``), then all revision numbers
-        are validated and each distinct revision's complete snapshot is
-        read once (a boolean, non-integer or non-positive number, or a
-        missing, pruned/compacted-away, unreadable or corrupt revision
-        raises ``SchemaConflict``), and only then is the records
-        iterator obtained - a non-iterable ``records`` raises
-        ``ValueError``. Every check runs before the return and without
-        consuming a record, an empty input included. The snapshots and
+        forward and rollback rule group are validated (a non-array, a
+        length mismatch or an illegal rule raises ``ValueError``), then
+        all revision numbers are validated and each distinct revision's
+        complete snapshot is read once (a boolean, non-integer or
+        non-positive number, or a missing, pruned/compacted-away,
+        unreadable or corrupt revision raises ``SchemaConflict``), and
+        only then is the records iterator obtained - a non-iterable
+        ``records`` raises ``ValueError``. Every check runs before the
+        return and without consuming a record, an empty input included.
+        The snapshots and
         rule groups are frozen for the batch, so later commits,
         rollbacks, pruning, compaction (the anchor stays readable) or
         caller rule mutation cannot change a result; each pull consumes
@@ -2651,6 +2775,33 @@ class Lens:
                     group, label=f"step {step_number} migration rule"
                 )
             )
+        # The rollback groups are validated together with the forward
+        # ones, before any revision is read and before records is
+        # touched, so an illegal rollback rule can never be hidden behind
+        # a failing forward segment.
+        parsed_rollback_groups: list[list[dict]] | None = None
+        if rollback_rule_groups is not None:
+            if not isinstance(rollback_rule_groups, list):
+                raise ValueError(
+                    "rollback_rule_groups must be a JSON array of rule arrays"
+                )
+            if len(rollback_rule_groups) != len(revisions) - 1:
+                raise ValueError(
+                    "rollback_rule_groups length must equal the number of "
+                    "revision segments (len(revisions) - 1)"
+                )
+            parsed_rollback_groups = []
+            for step_number, group in enumerate(rollback_rule_groups, 1):
+                if not isinstance(group, list):
+                    raise ValueError(
+                        f"rollback step {step_number} rules must be a JSON array"
+                    )
+                parsed_rollback_groups.append(
+                    _parse_migration_rules(
+                        group,
+                        label=f"rollback step {step_number} migration rule",
+                    )
+                )
         # 2. Every revision number, then one snapshot read per distinct
         # version, so one invalid or missing/corrupt revision rejects the
         # whole path before the iterator is obtained. Repeats share the
@@ -2702,6 +2853,30 @@ class Lens:
             )
             for step_number in range(1, len(path))
         ]
+        # The reverse path runs the segments in reverse order, segment N
+        # migrating the record from revisions[N] back to revisions[N-1]
+        # with that segment's own rollback group; its migrate report is
+        # the reverse pair's report. The groups are frozen like the
+        # forward ones, and each reverse pair report is deep-copied per
+        # record by the forward preview it feeds.
+        rollback_segments = None
+        if parsed_rollback_groups is not None:
+            frozen_rollback_groups = copy.deepcopy(parsed_rollback_groups)
+            rollback_segments = [
+                (
+                    step_number,
+                    roots[path[step_number]],
+                    roots[path[step_number - 1]],
+                    frozen_rollback_groups[step_number - 1],
+                    _pair_compat_report(
+                        path[step_number],
+                        path[step_number - 1],
+                        roots[path[step_number]],
+                        roots[path[step_number - 1]],
+                    ),
+                )
+                for step_number in range(len(path) - 1, 0, -1)
+            ]
 
         def _results() -> Iterator[dict]:
             index = 0
@@ -2720,7 +2895,7 @@ class Lens:
                         raise ValueError("record must be a JSON object")
                     _require_json_value(record, "record")
                     report = _path_migration_preview(
-                        record, endpoint_report, segments
+                        record, endpoint_report, segments, rollback_segments
                     )
                 except ValueError as exc:
                     yield {"index": index, "report": None, "error": str(exc)}
