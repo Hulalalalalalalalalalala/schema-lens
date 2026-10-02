@@ -159,6 +159,23 @@ unchanged. The snapshots and rules are frozen for the batch, so later
 commits, compaction or caller mutation cannot change results; the
 preview is otherwise read-only apart from the one legacy layout
 migration a first read may perform.
+
+``migrate_path_stream(records, revisions, rule_groups)`` extends that
+stream to a multi-segment path: ``revisions`` names at least two
+committed revisions (descending, repeated and adjacent-equal numbers
+allowed) and ``rule_groups`` carries one rule array per adjacent
+segment. Each record travels the segments in order, every segment
+running the same source-check/rules/target-check preview as
+``migrate`` on the previous segment's migrated record; a segment that
+stops at ``"source"`` or ``"target"`` ends that record's path early.
+The report keeps the compat report of the path's first and last
+revisions and adds ``steps`` (the full migrate report of every
+attempted segment, in path order) and ``migration`` (the last
+attempted segment's migration object, holding the terminal record
+when every segment succeeded). Validation, freezing, per-record error
+isolation (a rule ``ValueError`` in segment N surfaces as
+``"step N: ..."``), one-record-per-pull streaming and the read-only
+guarantees are exactly those of ``migrate_stream``.
 """
 
 from __future__ import annotations
@@ -2488,6 +2505,195 @@ class Lens:
                         parsed_rules,
                         parsed_rollback_rules,
                     )
+                except ValueError as exc:
+                    yield {"index": index, "report": None, "error": str(exc)}
+                    continue
+                yield {"index": index, "report": report, "error": None}
+
+        return _results()
+
+    def migrate_path_stream(
+        self,
+        records: Iterable[Any],
+        revisions: list,
+        rule_groups: list,
+    ) -> Iterator[dict]:
+        """Stream a multi-segment migration preview over many JSON records.
+
+        ``revisions`` is a JSON array of at least two revision numbers
+        describing the path each record travels (descending, repeated and
+        adjacent-equal numbers are all allowed), and ``rule_groups`` is a
+        JSON array holding exactly one rename/drop/default rule array per
+        adjacent segment, so ``len(rule_groups) == len(revisions) - 1``.
+        Every segment uses exactly the rule, literal-field-name and
+        array-wildcard semantics of :meth:`migrate`, and a segment whose
+        two revisions are equal still applies its rules. Each yielded
+        result is::
+
+            {"index": <1-based>, "report": <path report> | None,
+             "error": <message> | None}
+
+        The report keeps the complete :meth:`compat` report of the
+        path's first and last revisions (every field and verdict
+        unchanged) and adds two keys::
+
+            {
+              ...the compat report for (revisions[0], revisions[-1]),
+              "steps": [<full migrate report per attempted segment>],
+              "migration": <the last attempted segment's migration>,
+            }
+
+        ``steps`` lists the attempted segments in path order; each
+        segment receives the previous segment's migrated record, so a
+        field renamed twice in a row lands under its final name in the
+        terminal record. A segment that stops at ``"source"`` or
+        ``"target"`` ends the path for that record: the failed segment
+        stays as the last step and the remaining segments never run.
+        ``migration`` equals the last attempted segment's ``migration``
+        object, so a fully successful path carries the terminal record
+        under ``migration["record"]``.
+
+        A record that is not a JSON object or carries a non-JSON value
+        yields ``report: None`` with the message in ``error``, exactly
+        like :meth:`migrate_stream`; a ``ValueError`` raised while
+        segment N's rules run yields ``error`` of ``"step N: "`` plus
+        the original message (N is 1-based) and ``report: None``. The
+        stream then continues with the next record; indices run
+        continuously from 1.
+
+        Before the result iterator is returned - and before a single
+        record is consumed - the path container and every rule group
+        are validated (a non-array ``revisions`` or ``rule_groups``, a
+        path shorter than two revisions, a group count that does not
+        match the segment count, or an illegal rule raises
+        ``ValueError``), then every revision number is validated and
+        each distinct version's complete snapshot is read exactly once
+        (a boolean, non-integer or non-positive number and a missing,
+        pruned/compacted-away, unreadable or corrupt revision raise
+        ``SchemaConflict``; the compaction anchor stays readable), and
+        only then is the records iterator obtained (a non-iterable
+        raises ``ValueError``). An empty input is validated the same
+        way and then yields nothing. The snapshots and rule groups are
+        frozen for the whole batch, so later commits, pruning,
+        compaction or caller mutation of the rule groups cannot change
+        a result.
+
+        Each iteration consumes exactly one record - nothing is
+        prefetched - and internal retention does not grow with the
+        number of records processed. A non-``StopIteration`` exception
+        raised by the records iterator itself terminates the stream
+        unchanged, with every result already yielded retained. Input
+        records are never mutated and results share no mutable data
+        with the inputs, the rule defaults or each other; the same
+        inputs always yield the same content in the same order. Like
+        the other migration entry points it is read-only apart from
+        the one legacy single-file migration the first snapshot read
+        may perform.
+        """
+        # 1. The path container and the rule groups, so a malformed path
+        # or an illegal rule reports before any revision is read and
+        # before records is touched.
+        if not isinstance(revisions, list) or len(revisions) < 2:
+            raise ValueError(
+                "revisions must be a JSON array of at least two revision "
+                "numbers"
+            )
+        if not isinstance(rule_groups, list):
+            raise ValueError("rule_groups must be a JSON array of rule arrays")
+        if len(rule_groups) != len(revisions) - 1:
+            raise ValueError(
+                "rule_groups must hold exactly one rule array per path "
+                "segment"
+            )
+        parsed_groups = [_parse_migration_rules(group) for group in rule_groups]
+        # 2. Every revision number, then each distinct version's complete
+        # snapshot exactly once. A conflict here propagates before
+        # records is iterated.
+        for revision in revisions:
+            if (
+                isinstance(revision, bool)
+                or not isinstance(revision, int)
+                or revision < 1
+            ):
+                raise SchemaConflict(f"unknown schema revision: {revision!r}")
+        roots: dict[int, dict] = {}
+        for revision in revisions:
+            if revision not in roots:
+                roots[revision] = self._read_revision(revision)
+        # 3. Obtain the iterator last; a non-iterable records raises
+        # ValueError here, still without consuming anything.
+        try:
+            record_iterator = iter(records)
+        except TypeError as exc:
+            raise ValueError("records must be an iterable of JSON objects") from exc
+        # Freeze the validated rule groups so later caller mutation cannot
+        # reach this batch; the snapshots in hand are already independent
+        # in-memory copies (see migrate_stream). The per-segment and the
+        # end-to-end compat reports are built once from those frozen
+        # roots and deep-copied per record inside the helpers.
+        parsed_groups = [copy.deepcopy(group) for group in parsed_groups]
+        segment_plans = [
+            (
+                _pair_compat_report(
+                    revisions[segment],
+                    revisions[segment + 1],
+                    roots[revisions[segment]],
+                    roots[revisions[segment + 1]],
+                ),
+                roots[revisions[segment]],
+                roots[revisions[segment + 1]],
+                parsed_groups[segment],
+            )
+            for segment in range(len(revisions) - 1)
+        ]
+        path_base_report = _pair_compat_report(
+            revisions[0],
+            revisions[-1],
+            roots[revisions[0]],
+            roots[revisions[-1]],
+        )
+
+        def _path_preview(record: dict) -> dict:
+            """Run one record along the whole segment path."""
+            steps: list[dict] = []
+            current = record
+            for number, (base, old_root, new_root, group) in enumerate(
+                segment_plans, 1
+            ):
+                try:
+                    segment_report, migrated = _forward_migration(
+                        base, current, old_root, new_root, group
+                    )
+                except ValueError as exc:
+                    raise ValueError(f"step {number}: {exc}") from exc
+                steps.append(segment_report)
+                if segment_report["migration"]["stage"] != "done":
+                    # A segment stuck at its source or target check ends
+                    # the path; the failed segment stays the last step
+                    # and the remaining segments never run.
+                    break
+                current = migrated
+            report = copy.deepcopy(path_base_report)
+            report["steps"] = steps
+            report["migration"] = copy.deepcopy(steps[-1]["migration"])
+            return report
+
+        def _results() -> Iterator[dict]:
+            index = 0
+            while True:
+                # One record per iteration; ``next`` is the only consumer
+                # call (see migrate_stream for the StopIteration and
+                # propagation contract).
+                try:
+                    record = next(record_iterator)
+                except StopIteration:
+                    return
+                index += 1
+                try:
+                    if not isinstance(record, dict):
+                        raise ValueError("record must be a JSON object")
+                    _require_json_value(record, "record")
+                    report = _path_preview(record)
                 except ValueError as exc:
                     yield {"index": index, "report": None, "error": str(exc)}
                     continue
