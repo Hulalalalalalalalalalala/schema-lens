@@ -5637,6 +5637,571 @@ class MigratePathStreamTests(unittest.TestCase):
         self.assertEqual(sorted(os.listdir(versions_dir)), before)
 
 
+class MigratePathStreamRollbackTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.lens = Lens(self.dir.name)
+
+    def _publish(self, records, revision, **limits):
+        return _publish(self.dir.name, records, revision, **limits)
+
+    def _rename_chain(self):
+        # A field renamed a -> b -> c over three revisions; the rollback
+        # groups rename it back, group i belonging to forward segment i+1.
+        self._publish([{"a": 1}], 1)
+        self._publish([{"b": 1}], 2)
+        self._publish([{"c": 1}], 3)
+        forward = [
+            [{"op": "rename", "path": ["a"], "to": "b"}],
+            [{"op": "rename", "path": ["b"], "to": "c"}],
+        ]
+        backward = [
+            [{"op": "rename", "path": ["b"], "to": "a"}],
+            [{"op": "rename", "path": ["c"], "to": "b"}],
+        ]
+        return forward, backward
+
+    # -- output shape ----------------------------------------------------
+
+    def test_omitted_and_none_leave_the_report_unchanged(self):
+        groups, back = self._rename_chain()
+        records = [{"a": 1}, {"a": 2}]
+        plain = list(self.lens.migrate_path_stream(records, [1, 2, 3], groups))
+        none = list(
+            self.lens.migrate_path_stream(
+                records, [1, 2, 3], groups, rollback_rule_groups=None
+            )
+        )
+        self.assertEqual(plain, none)
+        for result in plain:
+            self.assertNotIn("rollback_steps", result["report"])
+            self.assertNotIn("rollback", result["report"])
+        enabled = list(
+            self.lens.migrate_path_stream(records, [1, 2, 3], groups, back)
+        )
+        self.assertEqual(len(enabled), 2)
+        for result in enabled:
+            self.assertEqual(set(result), {"index", "report", "error"})
+            self.assertIsNone(result["error"])
+            self.assertEqual(
+                set(result["report"]),
+                {"from", "to", "backward", "forward", "changes",
+                 "unknown_reasons", "steps", "migration",
+                 "rollback_steps", "rollback"},
+            )
+        # The forward part of the report is exactly the plain report.
+        for with_back, without in zip(enabled, plain):
+            for key in without["report"]:
+                self.assertEqual(with_back["report"][key],
+                                 without["report"][key])
+
+    def test_full_roundtrip_recovers_the_original_record(self):
+        groups, back = self._rename_chain()
+        results = list(
+            self.lens.migrate_path_stream([{"a": 7}], [1, 2, 3], groups, back)
+        )
+        report = results[0]["report"]
+        self.assertEqual(
+            report["rollback"],
+            {"stage": "done", "record": {"a": 7}, "reports": [],
+             "differences": []},
+        )
+        # Reverse segments execute last-forward-segment first.
+        self.assertEqual(
+            [(s["from"], s["to"]) for s in report["rollback_steps"]],
+            [(3, 2), (2, 1)],
+        )
+        self.assertEqual(
+            [s["migration"]["record"] for s in report["rollback_steps"]],
+            [{"b": 7}, {"a": 7}],
+        )
+
+    def test_rollback_steps_are_complete_migrate_reports_in_execution_order(self):
+        groups, back = self._rename_chain()
+        results = list(
+            self.lens.migrate_path_stream([{"a": 1}], [1, 2, 3], groups, back)
+        )
+        report = results[0]["report"]
+        self.assertEqual(len(report["rollback_steps"]), 2)
+        for step in report["rollback_steps"]:
+            self.assertEqual(
+                set(step),
+                {"from", "to", "backward", "forward", "changes",
+                 "unknown_reasons", "migration"},
+            )
+        self.assertEqual(
+            report["rollback_steps"][0],
+            self.lens.migrate({"c": 1}, 3, 2, back[1]),
+        )
+        self.assertEqual(
+            report["rollback_steps"][1],
+            self.lens.migrate({"b": 1}, 2, 1, back[0]),
+        )
+
+    def test_rollback_group_applies_its_rules_in_their_own_order(self):
+        self._publish([{"a": 1}], 1)
+        self._publish([{"b": 1}], 2)
+        groups = [[{"op": "rename", "path": ["a"], "to": "b"}]]
+        # drop then re-default inside one group, applied in group order.
+        back = [[
+            {"op": "rename", "path": ["b"], "to": "a"},
+            {"op": "drop", "path": ["a"]},
+            {"op": "default", "path": ["a"], "value": 3},
+        ]]
+        results = list(
+            self.lens.migrate_path_stream([{"a": 9}], [1, 2], groups, back)
+        )
+        rollback = results[0]["report"]["rollback"]
+        self.assertEqual(rollback["stage"], "different")
+        self.assertEqual(rollback["record"], {"a": 3})
+        self.assertEqual(rollback["differences"], ["$.a"])
+
+    def test_same_version_segment_runs_its_rollback_rules(self):
+        self._publish([{"a": 1}], 1)
+        groups = [[
+            {"op": "drop", "path": ["a"]},
+            {"op": "default", "path": ["a"], "value": 5},
+        ]]
+        back = [[
+            {"op": "drop", "path": ["a"]},
+            {"op": "default", "path": ["a"], "value": 7},
+        ]]
+        results = list(
+            self.lens.migrate_path_stream([{"a": 9}], [1, 1], groups, back)
+        )
+        report = results[0]["report"]
+        self.assertEqual(report["migration"]["record"], {"a": 5})
+        self.assertEqual(
+            [(s["from"], s["to"]) for s in report["rollback_steps"]],
+            [(1, 1)],
+        )
+        self.assertEqual(report["rollback"]["stage"], "different")
+        self.assertEqual(report["rollback"]["record"], {"a": 7})
+        self.assertEqual(report["rollback"]["differences"], ["$.a"])
+
+    # -- forward not done -------------------------------------------------
+
+    def test_forward_source_stop_gives_empty_steps_and_null_rollback(self):
+        groups, back = self._rename_chain()
+        results = list(
+            self.lens.migrate_path_stream([{"x": 1}], [1, 2, 3], groups, back)
+        )
+        report = results[0]["report"]
+        self.assertEqual(report["migration"]["stage"], "source")
+        self.assertEqual(report["rollback_steps"], [])
+        self.assertIsNone(report["rollback"])
+
+    def test_forward_mid_path_stop_gives_empty_steps_and_null_rollback(self):
+        groups, back = self._rename_chain()
+        # Step 1 carries no rules, so {"a": 1} fails revision 2's
+        # required b at the target check and step 2 never runs.
+        results = list(
+            self.lens.migrate_path_stream(
+                [{"a": 1}], [1, 2, 3], [[], groups[1]], back
+            )
+        )
+        report = results[0]["report"]
+        self.assertEqual(report["migration"]["stage"], "target")
+        self.assertEqual(len(report["steps"]), 1)
+        self.assertEqual(report["rollback_steps"], [])
+        self.assertIsNone(report["rollback"])
+
+    # -- rollback check failures -----------------------------------------
+
+    def test_rollback_target_stop_keeps_failing_segment_and_stops(self):
+        groups, _back = self._rename_chain()
+        # No rollback rules: the recovered {"c": 7} fails revision 2.
+        results = list(
+            self.lens.migrate_path_stream(
+                [{"a": 7}], [1, 2, 3], groups, [[], []]
+            )
+        )
+        report = results[0]["report"]
+        self.assertEqual(report["migration"]["stage"], "done")
+        # Only the first reverse segment (3 -> 2) ran; (2 -> 1) never did.
+        self.assertEqual(len(report["rollback_steps"]), 1)
+        self.assertEqual(
+            (report["rollback_steps"][0]["from"],
+             report["rollback_steps"][0]["to"]),
+            (3, 2),
+        )
+        self.assertEqual(
+            report["rollback"],
+            {"stage": "target", "record": None,
+             "reports": self.lens.check({"c": 7}, version=2),
+             "differences": []},
+        )
+        self.assertTrue(report["rollback"]["reports"])
+
+    def test_rollback_stop_in_a_later_reverse_segment(self):
+        groups, back = self._rename_chain()
+        # The first reverse segment recovers b; the second has no rules,
+        # so {"b": 7} fails revision 1's required a.
+        results = list(
+            self.lens.migrate_path_stream(
+                [{"a": 7}], [1, 2, 3], groups, [[], back[1]]
+            )
+        )
+        report = results[0]["report"]
+        self.assertEqual(len(report["rollback_steps"]), 2)
+        self.assertEqual(
+            report["rollback"],
+            {"stage": "target", "record": None,
+             "reports": self.lens.check({"b": 7}, version=1),
+             "differences": []},
+        )
+
+    def test_rollback_object_has_exactly_the_roundtrip_keys(self):
+        groups, back = self._rename_chain()
+        results = list(
+            self.lens.migrate_path_stream([{"a": 1}], [1, 2, 3], groups, back)
+        )
+        self.assertEqual(
+            set(results[0]["report"]["rollback"]),
+            {"stage", "record", "reports", "differences"},
+        )
+
+    def test_rollback_different_lists_every_differing_path(self):
+        self._publish([{"a": 1, "b": "x"}], 1)
+        self._publish([{"c": 1, "b": "x"}], 2)
+        groups = [[{"op": "rename", "path": ["a"], "to": "c"}]]
+        back = [[{"op": "drop", "path": ["c"]},
+                 {"op": "default", "path": ["a"], "value": 0}]]
+        results = list(
+            self.lens.migrate_path_stream(
+                [{"a": 7, "b": "y"}], [1, 2], groups, back
+            )
+        )
+        rollback = results[0]["report"]["rollback"]
+        self.assertEqual(rollback["stage"], "different")
+        self.assertEqual(rollback["record"], {"a": 0, "b": "y"})
+        self.assertEqual(rollback["reports"], [])
+        self.assertEqual(rollback["differences"], ["$.a"])
+
+    # -- per-record errors -------------------------------------------------
+
+    def test_rollback_rule_error_is_prefixed_with_forward_segment_number(self):
+        # Every revision tolerates an optional "extra" field, so one
+        # record can carry a value the rollback rule collides with.
+        self._publish([{"a": 1}, {"a": 2, "extra": 1}], 1)
+        self._publish([{"b": 1}, {"b": 2, "extra": 1}], 2)
+        self._publish([{"c": 1}, {"c": 2, "extra": 1}], 3)
+        groups = [
+            [{"op": "rename", "path": ["a"], "to": "b"}],
+            [{"op": "rename", "path": ["b"], "to": "c"}],
+        ]
+        back = [
+            [{"op": "rename", "path": ["b"], "to": "a"},
+             {"op": "rename", "path": ["extra"], "to": "a"}],
+            [{"op": "rename", "path": ["c"], "to": "b"}],
+        ]
+        results = list(
+            self.lens.migrate_path_stream(
+                [{"a": 1, "extra": 5}, {"a": 2}], [1, 2, 3], groups, back
+            )
+        )
+        # The failing group belongs to forward segment 1 (it runs last
+        # in the reverse order, but keeps the forward segment's number).
+        self.assertEqual(
+            results[0],
+            {"index": 1, "report": None,
+             "error": "rollback step 1: rename target 'a' already exists"},
+        )
+        # The stream continues; the next record rolls back cleanly.
+        self.assertIsNone(results[1]["error"])
+        self.assertEqual(
+            results[1]["report"]["rollback"],
+            {"stage": "done", "record": {"a": 2}, "reports": [],
+             "differences": []},
+        )
+
+    def test_rollback_error_numbers_the_forward_segment_not_execution_order(self):
+        groups, back = self._rename_chain()
+        # The failing group belongs to forward segment 1, so it executes
+        # last in the rollback yet reports "rollback step 1".
+        back[0] = [{"op": "drop", "path": ["b", "x"]}]
+        results = list(
+            self.lens.migrate_path_stream([{"a": 1}], [1, 2, 3], groups, back)
+        )
+        self.assertIsNone(results[0]["report"])
+        self.assertEqual(
+            results[0]["error"],
+            "rollback step 1: string path segment requires an object",
+        )
+
+    def test_forward_step_error_still_uses_the_plain_prefix(self):
+        groups, back = self._rename_chain()
+        groups[0] = [{"op": "drop", "path": ["a", "x"]}]
+        results = list(
+            self.lens.migrate_path_stream([{"a": 1}], [1, 2, 3], groups, back)
+        )
+        self.assertEqual(
+            results[0]["error"],
+            "step 1: string path segment requires an object",
+        )
+
+    def test_non_json_record_error_carries_no_rollback_keys(self):
+        groups, back = self._rename_chain()
+        results = list(
+            self.lens.migrate_path_stream(
+                [{"a": 1}, None, {"a": 2}], [1, 2, 3], groups, back
+            )
+        )
+        self.assertIsNone(results[1]["report"])
+        self.assertIsNotNone(results[1]["error"])
+        self.assertEqual(results[2]["report"]["rollback"]["stage"], "done")
+
+    # -- eager validation --------------------------------------------------
+
+    def _tracking_source(self, records):
+        source = {"started": False, "records": records}
+
+        def generate():
+            source["started"] = True
+            yield from records
+
+        source["iterator_factory"] = generate
+        return source
+
+    def test_rollback_container_validation(self):
+        groups, back = self._rename_chain()
+        for rollback_rule_groups in (
+            "x",
+            7,
+            {"a": 1},
+            back[:1],
+            back + [[]],
+            ["x", []],
+            [[{"op": "nope"}], []],
+            [[], [{"op": "rename", "path": ["c"], "to": "c"}]],
+        ):
+            with self.subTest(rollback_rule_groups=rollback_rule_groups):
+                with self.assertRaises(ValueError):
+                    self.lens.migrate_path_stream(
+                        None, [1, 2, 3], groups, rollback_rule_groups
+                    )
+
+    def test_rollback_rules_validated_before_revisions_and_records(self):
+        groups, _back = self._rename_chain()
+        source = self._tracking_source([{"a": 1}])
+        # An illegal rollback rule reports as ValueError even though the
+        # revisions are bad too (rules are validated first) ...
+        with self.assertRaises(ValueError):
+            self.lens.migrate_path_stream(
+                source["iterator_factory"](),
+                [1, 2, 99],
+                groups,
+                [[{"op": "nope"}], []],
+            )
+        self.assertFalse(source["started"])
+        # ... and a valid rollback configuration still hits the bad
+        # revision as SchemaConflict, before any record is consumed.
+        with self.assertRaises(SchemaConflict):
+            self.lens.migrate_path_stream(
+                source["iterator_factory"](),
+                [1, 2, 99],
+                groups,
+                [[], []],
+            )
+        self.assertFalse(source["started"])
+
+    def test_empty_input_validates_rollback_and_yields_nothing(self):
+        groups, back = self._rename_chain()
+        self.assertEqual(
+            list(self.lens.migrate_path_stream([], [1, 2, 3], groups, back)),
+            [],
+        )
+        with self.assertRaises(ValueError):
+            self.lens.migrate_path_stream([], [1, 2, 3], groups, [[{"op": "bad"}], []])
+        with self.assertRaises(ValueError):
+            self.lens.migrate_path_stream([], [1, 2, 3], groups, [[]])
+        with self.assertRaises(SchemaConflict):
+            self.lens.migrate_path_stream([], [1, 2, 9], groups, back)
+        with self.assertRaises(ValueError):
+            self.lens.migrate_path_stream(42, [1, 2, 3], groups, back)
+
+    def test_non_iterable_records_raise_value_error_with_rollback(self):
+        groups, back = self._rename_chain()
+        with self.assertRaises(ValueError):
+            self.lens.migrate_path_stream(7, [1, 2, 3], groups, back)
+
+    # -- streaming, freezing, independence ---------------------------------
+
+    def test_one_record_consumed_per_pull_with_rollback(self):
+        groups, back = self._rename_chain()
+        pulled = []
+
+        def generate():
+            for value in (1, 2, 3):
+                record = {"a": value}
+                pulled.append(record)
+                yield record
+
+        stream = self.lens.migrate_path_stream(
+            generate(), [1, 2, 3], groups, back
+        )
+        self.assertEqual(pulled, [])
+        next(stream)
+        self.assertEqual(len(pulled), 1)
+        next(stream)
+        self.assertEqual(len(pulled), 2)
+        list(stream)
+        self.assertEqual(len(pulled), 3)
+
+    def test_caller_mutating_rollback_groups_after_call_does_not_change_batch(self):
+        groups, back = self._rename_chain()
+        records = [{"a": 1}, {"a": 2}]
+        expected = [
+            list(self.lens.migrate_path_stream([r], [1, 2, 3], groups, back))[0]
+            for r in records
+        ]
+        mutable_back = copy.deepcopy(back)
+        stream = self.lens.migrate_path_stream(
+            iter(records), [1, 2, 3], groups, mutable_back
+        )
+        first = next(stream)
+        mutable_back[0][0]["to"] = "zzz"
+        mutable_back.append([{"op": "drop", "path": ["a"]}])
+        self.assertEqual(first["report"], expected[0]["report"])
+        self.assertEqual(next(stream)["report"], expected[1]["report"])
+
+    def test_commit_after_return_does_not_change_rollback_results(self):
+        groups, back = self._rename_chain()
+        records = [{"a": 1}, {"a": 2}]
+        expected = [
+            list(self.lens.migrate_path_stream([r], [1, 2, 3], groups, back))[0]
+            for r in records
+        ]
+        stream = self.lens.migrate_path_stream(
+            iter(records), [1, 2, 3], groups, back
+        )
+        first = next(stream)
+        self._publish([{"q": 1}], 4)
+        rest = list(stream)
+        self.assertEqual(first["report"], expected[0]["report"])
+        self.assertEqual(rest[0]["report"], expected[1]["report"])
+
+    def test_input_records_and_rules_are_not_modified(self):
+        groups, back = self._rename_chain()
+        records = [{"a": 1}, {"a": 2}]
+        originals = copy.deepcopy(records)
+        frozen_groups = copy.deepcopy(groups)
+        frozen_back = copy.deepcopy(back)
+        list(self.lens.migrate_path_stream(records, [1, 2, 3], groups, back))
+        self.assertEqual(records, originals)
+        self.assertEqual(groups, frozen_groups)
+        self.assertEqual(back, frozen_back)
+
+    def test_rollback_results_are_independent_of_each_other(self):
+        groups, back = self._rename_chain()
+        stream = self.lens.migrate_path_stream(
+            iter([{"a": 1}, {"a": 2}]), [1, 2, 3], groups, back
+        )
+        first = next(stream)["report"]
+        first["rollback"]["record"]["a"] = 999
+        first["rollback_steps"][0]["migration"]["record"]["b"] = 999
+        first["rollback"]["differences"].append("tampered")
+        second = next(stream)["report"]
+        self.assertEqual(second["rollback"]["record"], {"a": 2})
+        self.assertEqual(
+            second["rollback_steps"][0]["migration"]["record"], {"b": 2}
+        )
+        self.assertEqual(second["rollback"]["differences"], [])
+
+    def test_rollback_record_is_independent_of_the_step_records(self):
+        groups, back = self._rename_chain()
+        report = list(
+            self.lens.migrate_path_stream([{"a": 1}], [1, 2, 3], groups, back)
+        )[0]["report"]
+        report["rollback"]["record"]["a"] = 999
+        self.assertEqual(
+            report["rollback_steps"][-1]["migration"]["record"], {"a": 1}
+        )
+
+    def test_processed_records_are_not_retained_with_rollback(self):
+        import gc
+        import weakref
+
+        groups, back = self._rename_chain()
+
+        class Record(dict):
+            """A dict subclass so weak references to records are possible."""
+
+        refs: list = []
+
+        def generate():
+            for index in range(50):
+                record = Record(a=index)
+                refs.append(weakref.ref(record))
+                yield record
+
+        stream = self.lens.migrate_path_stream(
+            generate(), [1, 2, 3], groups, back
+        )
+        last = next(stream)
+        for _ in range(49):
+            last = next(stream)
+        gc.collect()
+        self.assertTrue(all(ref() is None for ref in refs[:-1]))
+        self.assertIsNotNone(refs[-1]())
+
+    def test_repeated_streams_with_rollback_are_stable(self):
+        groups, back = self._rename_chain()
+        records = [{"a": 1}, {"a": 2}]
+        first = [
+            json.dumps(r, sort_keys=True)
+            for r in self.lens.migrate_path_stream(records, [1, 2, 3], groups, back)
+        ]
+        for _ in range(3):
+            again = [
+                json.dumps(r, sort_keys=True)
+                for r in self.lens.migrate_path_stream(
+                    records, [1, 2, 3], groups, back
+                )
+            ]
+            self.assertEqual(again, first)
+
+    # -- persistence guarantees ---------------------------------------------
+
+    def test_legacy_single_file_migrates_on_first_read_with_rollback(self):
+        folder = Lens(tempfile.mkdtemp())
+        folder.infer([{"a": 1}])
+        root = folder.schema()
+        from schema_lens.core import _checksum
+
+        legacy = Path(self.dir.name, SCHEMA_FILENAME)
+        legacy.write_text(
+            json.dumps({"version": 2, "checksum": _checksum(root), "root": root})
+        )
+        lens = Lens(self.dir.name)
+        results = lens.migrate_path_stream(
+            [{"a": 1}], [1, 1], [[]], [[]]
+        )
+        self.assertEqual(lens.versions(), [1])
+        self.assertFalse(legacy.exists())
+        report = next(results)["report"]
+        self.assertEqual(report["migration"]["stage"], "done")
+        self.assertEqual(report["rollback"]["stage"], "done")
+
+    def test_open_snapshot_batches_and_files_are_untouched_with_rollback(self):
+        groups, back = self._rename_chain()
+        self.lens.load()
+        self.lens.infer([{"pending": 1}])
+        snapshot = self.lens.schema()
+        versions_dir = Path(self.dir.name, VERSIONS_DIRNAME)
+        before = sorted(os.listdir(versions_dir))
+        list(
+            self.lens.migrate_path_stream(
+                [{"a": 1}, "bad"], [1, 2, 3], groups, back
+            )
+        )
+        self.assertEqual(self.lens.schema(), snapshot)
+        self.assertEqual(self.lens.check({"pending": 1}), [])
+        self.assertEqual(self.lens.versions(), [1, 2, 3])
+        self.assertEqual(sorted(os.listdir(versions_dir)), before)
+
+
 if __name__ == "__main__":
     unittest.main()
 
