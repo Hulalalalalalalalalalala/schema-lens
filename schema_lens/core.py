@@ -159,6 +159,34 @@ unchanged. The snapshots and rules are frozen for the batch, so later
 commits, compaction or caller mutation cannot change results; the
 preview is otherwise read-only apart from the one legacy layout
 migration a first read may perform.
+
+``migrate_path_stream(records, revisions, rule_groups)`` previews one
+migration path through several committed revisions, streaming the same
+batch of records segment by segment so a failure can be located at an
+intermediate version. ``revisions`` is a JSON array of at least two
+revision numbers - descending order, repeats and adjacent identical
+versions are all allowed; ``rule_groups`` is an array with one rule
+array per adjacent pair, exactly one fewer entry than ``revisions``.
+Each segment is the ordinary source-check/rules/target-check preview
+(the same literal field names and ``null`` array-wildcard path
+semantics, and a same-version segment still runs its rules), and each
+segment after the first receives the previous segment's migrated
+record; a segment that stops at ``"source"`` or ``"target"`` terminates
+that record's path and the remaining segments never run. The result
+report keeps every field of the compat report for the path's first and
+last revision with its original verdicts, plus ``steps`` (the complete
+``migrate`` report of every segment attempted, in path order) and
+``migration`` (the same object the last attempted segment carries,
+including the endpoint record when every segment succeeds). Like
+``migrate_stream`` it validates the path containers, every rule group,
+all revision numbers and each distinct snapshot, and only then obtains
+the records iterator; one record is consumed per pull with no
+prefetch, an invalid record or a segment rule ``ValueError`` becomes a
+per-record error (``"step N: "`` plus the rule message, N 1-based) and
+the stream continues, while any other iterator exception propagates
+unchanged. Snapshots and rules are frozen for the batch and the
+preview is read-only apart from the one legacy layout migration a
+first read may perform.
 """
 
 from __future__ import annotations
@@ -1558,6 +1586,49 @@ def _migration_preview(
     return report
 
 
+def _path_migration_preview(
+    record: dict,
+    endpoint_report: dict,
+    segments: list[tuple[dict, dict, list[dict], dict]],
+) -> dict:
+    """Preview one record through an ordered sequence of migration segments.
+
+    ``segments`` lists, in path order,
+    ``(old_root, new_root, rules, base_report)`` per adjacent revision
+    pair; ``endpoint_report`` is the prebuilt compat report for the
+    path's first and last revision and ``base_report`` the pair's own
+    compat report, each deep-copied by the forward preview it feeds.
+    Each segment is the ordinary forward preview over the previous
+    segment's migrated record; a segment stopping at ``"source"`` or
+    ``"target"`` ends the path with that segment kept and the remaining
+    segments unrun. The returned report carries every endpoint compat
+    field, a ``steps`` list of the complete segment reports and a
+    ``migration`` object equal to the last attempted segment's. A
+    structural ``ValueError`` raised while segment ``N`` (1-based) runs is
+    re-raised prefixed with ``"step N: "``; an invalid record is rejected
+    by the caller before this helper runs.
+    """
+    report = copy.deepcopy(endpoint_report)
+    steps: list[dict] = []
+    current = record
+    for step_number, (old_root, new_root, rules, base_report) in enumerate(
+        segments, 1
+    ):
+        try:
+            step_report, migrated = _forward_migration(
+                base_report, current, old_root, new_root, rules
+            )
+        except ValueError as exc:
+            raise ValueError(f"step {step_number}: {exc}") from exc
+        steps.append(step_report)
+        if step_report["migration"]["stage"] != "done":
+            break
+        current = migrated
+    report["steps"] = steps
+    report["migration"] = copy.deepcopy(steps[-1]["migration"])
+    return report
+
+
 def _normalize_overflow_names(node: Any) -> None:
     """Mark pre-tracking overflow entries with explicit ``names: None``.
 
@@ -2487,6 +2558,169 @@ class Lens:
                         new_root,
                         parsed_rules,
                         parsed_rollback_rules,
+                    )
+                except ValueError as exc:
+                    yield {"index": index, "report": None, "error": str(exc)}
+                    continue
+                yield {"index": index, "report": report, "error": None}
+
+        return _results()
+
+    def migrate_path_stream(
+        self,
+        records: Iterable[Any],
+        revisions: Any,
+        rule_groups: Any,
+    ) -> Iterator[dict]:
+        """Stream a multi-revision migration path preview over records.
+
+        The same batch of records is migrated segment by segment along
+        ``revisions`` - a JSON array of at least two revision numbers;
+        descending order, repeats and adjacent identical versions are
+        allowed and a same-version segment still runs its rules.
+        ``rule_groups`` is a JSON array holding one rule array per
+        adjacent pair, so its length is exactly ``len(revisions) - 1``;
+        every rule uses the rename/drop/default operations and the same
+        literal field-name and ``null`` array-wildcard path semantics as
+        :meth:`migrate`. Each segment is the ordinary
+        source-check/rules/target-check preview, and every segment after
+        the first receives the previous segment's migrated record; a
+        segment whose stage is ``"source"`` or ``"target"`` terminates
+        that record's path - the failing segment is kept and the
+        remaining segments never run.
+
+        Each yielded result is
+        ``{"index": <1-based>, "report": ... | None, "error": ... | None}``.
+        The report keeps every field of the :meth:`compat` report for the
+        path's first and last revision with its original verdicts, plus::
+
+            "steps": [<the complete migrate report of every segment
+                       attempted, in path order>],
+            "migration": <the migration object of the last attempted
+                          segment, including the endpoint record when
+                          every segment succeeds>,
+
+        A record that is not a JSON object or carries a non-JSON value,
+        or a rule of segment ``N`` raising ``ValueError`` while it runs,
+        yields ``report: None`` with the rule error as
+        ``"step N: <message>"`` (N counts from 1) and the stream
+        continues with the next record.
+
+        Before the iterator is returned the path containers and every
+        rule group are validated (a non-array, a length mismatch or an
+        illegal rule raises ``ValueError``), then all revision numbers
+        are validated and each distinct revision's complete snapshot is
+        read once (a boolean, non-integer or non-positive number, or a
+        missing, pruned/compacted-away, unreadable or corrupt revision
+        raises ``SchemaConflict``), and only then is the records
+        iterator obtained - a non-iterable ``records`` raises
+        ``ValueError``. Every check runs before the return and without
+        consuming a record, an empty input included. The snapshots and
+        rule groups are frozen for the batch, so later commits,
+        rollbacks, pruning, compaction (the anchor stays readable) or
+        caller rule mutation cannot change a result; each pull consumes
+        exactly one record with no prefetch and retention does not grow
+        with the number of records. A non-``StopIteration`` exception
+        from the records iterator propagates unchanged with every
+        result already yielded retained. Inputs are never mutated and
+        results share no mutable state with the inputs, the rule
+        defaults or each other. Like the other migration previews it is
+        read-only apart from the one legacy single-file migration the
+        first snapshot read may perform.
+        """
+        # 1. Path containers and every rule group first, so an illegal
+        # container or rule reports before any revision is read and
+        # before records is touched.
+        if not isinstance(revisions, list):
+            raise ValueError("revisions must be a JSON array of revision numbers")
+        if len(revisions) < 2:
+            raise ValueError("revisions must name at least two versions")
+        if not isinstance(rule_groups, list):
+            raise ValueError("rule_groups must be a JSON array of rule arrays")
+        if len(rule_groups) != len(revisions) - 1:
+            raise ValueError(
+                "rule_groups length must equal the number of revision "
+                "segments (len(revisions) - 1)"
+            )
+        parsed_groups: list[list[dict]] = []
+        for step_number, group in enumerate(rule_groups, 1):
+            if not isinstance(group, list):
+                raise ValueError(f"step {step_number} rules must be a JSON array")
+            parsed_groups.append(
+                _parse_migration_rules(
+                    group, label=f"step {step_number} migration rule"
+                )
+            )
+        # 2. Every revision number, then one snapshot read per distinct
+        # version, so one invalid or missing/corrupt revision rejects the
+        # whole path before the iterator is obtained. Repeats share the
+        # one frozen snapshot.
+        for revision in revisions:
+            if (
+                isinstance(revision, bool)
+                or not isinstance(revision, int)
+                or revision < 1
+            ):
+                raise SchemaConflict(f"unknown schema revision: {revision!r}")
+        roots: dict[int, dict] = {}
+        for revision in revisions:
+            if revision not in roots:
+                roots[revision] = self._read_revision(revision)
+        path = list(revisions)
+        endpoint_report = _pair_compat_report(
+            path[0], path[-1], roots[path[0]], roots[path[-1]]
+        )
+        # Each segment's pair report is pure frozen JSON and is
+        # deep-copied by the forward preview per record, so one template
+        # serves the whole batch.
+        pair_reports = [
+            _pair_compat_report(
+                path[step_number - 1],
+                path[step_number],
+                roots[path[step_number - 1]],
+                roots[path[step_number]],
+            )
+            for step_number in range(1, len(path))
+        ]
+        # 3. Obtain the records iterator last; a non-iterable records
+        # raises ValueError here, still without consuming anything.
+        try:
+            record_iterator = iter(records)
+        except TypeError as exc:
+            raise ValueError("records must be an iterable of JSON objects") from exc
+        # Freeze the validated rule groups so later caller mutation of
+        # either list cannot reach this batch; the snapshots are already
+        # independent in-memory copies only this batch's previews use,
+        # and the pair reports are deep-copied per record by the helper.
+        frozen_groups = copy.deepcopy(parsed_groups)
+        segments = [
+            (
+                roots[path[step_number - 1]],
+                roots[path[step_number]],
+                frozen_groups[step_number - 1],
+                pair_reports[step_number - 1],
+            )
+            for step_number in range(1, len(path))
+        ]
+
+        def _results() -> Iterator[dict]:
+            index = 0
+            while True:
+                # One record per iteration; ``next`` is the only consumer
+                # call. A generator's own StopIteration ends the stream,
+                # while any other exception the records iterator raises
+                # propagates verbatim.
+                try:
+                    record = next(record_iterator)
+                except StopIteration:
+                    return
+                index += 1
+                try:
+                    if not isinstance(record, dict):
+                        raise ValueError("record must be a JSON object")
+                    _require_json_value(record, "record")
+                    report = _path_migration_preview(
+                        record, endpoint_report, segments
                     )
                 except ValueError as exc:
                     yield {"index": index, "report": None, "error": str(exc)}

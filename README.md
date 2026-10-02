@@ -43,6 +43,7 @@ committed revision; without it they use the snapshot loaded at open time.
 - `migrate(record, old_revision, new_revision, rules) -> dict` returns the `compat` report for the pair plus a `migration` object previewing an explicit field-level migration of one JSON object: check against the old revision, apply the rename/drop/default rules in order, check against the new revision. Read-only like `compat`.
 - `migrate_roundtrip(record, old_revision, new_revision, rules, rollback_rules) -> dict` returns the full `migrate` report plus a `rollback` object, rehearsing whether the rollback rules restore the original object: rollback rules run only after the forward preview reaches `done`, the recovered record is checked against the old revision, then compared with the original key by key ignoring key order. Read-only like `migrate`.
 - `migrate_stream(records, old_revision, new_revision, rules, rollback_rules=None) -> Iterator[dict]` streams the same preview over an iterable of records (a one-shot iterator included), consuming one record per yielded result with no prefetch and bounded memory. Rules, revisions and both snapshots are validated eagerly before any record is consumed; each result is `{"index", "report", "error"}` with a continuous 1-based index. Read-only like `migrate`.
+- `migrate_path_stream(records, revisions, rule_groups) -> Iterator[dict]` streams a multi-revision path preview: `revisions` is an array of at least two revision numbers (descending order, repeats and adjacent identical versions allowed) and `rule_groups` one rule array per adjacent pair (`len(revisions) - 1`). Each segment is the ordinary `migrate` preview and the next segment receives the previous segment's migrated record; a `source`/`target` stop ends that record's path with the failing segment kept. The report keeps the first/last revision `compat` report fields and adds `steps` (the complete per-segment reports) plus `migration` (the last segment's object, with the endpoint record on full success). An invalid record or a segment rule `ValueError` becomes `{"index", "report": None, "error": "step N: ..."}` and the stream continues; containers, rules, revisions and each distinct snapshot are validated eagerly before any record is consumed, one record is consumed per pull with no prefetch, and snapshots and rules are frozen. Read-only like `migrate`.
 - `stats() -> dict` reports fields, optional fields, observed types and observation counts.
 - `SchemaConflict` exported exception.
 
@@ -570,6 +571,53 @@ perform, nothing is written and the open snapshot, pending batches and
 committed history are untouched. Same-revision batches still apply the
 rules to every record, and wildcard array paths work as for
 `migrate`.
+
+## Multi-revision path preview
+
+`migrate_path_stream(records, revisions, rule_groups)` (Python only)
+streams the same batch along a path through several committed
+revisions, so an intermediate failure can be located segment by
+segment. `revisions` is a JSON array of at least two revision numbers;
+descending order, repeats and adjacent identical versions are all
+allowed, and a same-version segment still runs its rules.
+`rule_groups` is a JSON array holding one rule array per adjacent
+pair, so it has exactly `len(revisions) - 1` entries. Each segment
+applies the ordinary source-check/rules/target-check preview with the
+same literal field names and array-wildcard path semantics, and every
+segment after the first receives the previous segment's migrated
+record; a segment that stops at `source` or `target` terminates that
+record's path with the failing segment kept and the remaining segments
+unrun. A field renamed twice therefore lands under its final name at
+the endpoint revision.
+
+Each result carries exactly `index`, `report` and `error`, with a
+continuous 1-based index. The report keeps all fields of the `compat`
+report for the path's first and last revision with their original
+verdicts, and adds `steps` - the complete `migrate` report of every
+segment attempted, in path order - and `migration`, the migration
+object of the last attempted segment, which carries the endpoint
+record when every segment succeeds. A record that is not a JSON object
+or carries a non-JSON value yields `report: null` with the same
+per-record error `migrate_stream` uses; a rule of segment `N` raising
+`ValueError` while it runs yields `report: null` with error
+`"step N: <message>"` (N counts from 1), and in both cases the stream
+continues with the next record. Any other exception from the records
+iterator propagates unchanged and results already yielded are kept.
+
+The call validates the path containers and every rule group first (a
+non-array, a length mismatch or an illegal rule is `ValueError`), then
+validates every revision number and reads each distinct revision's
+complete snapshot exactly once (a boolean, non-integer or non-positive
+number, or a missing, pruned/compacted-away, unreadable or corrupt
+revision is `SchemaConflict`), and only then obtains the records
+iterator, which must be iterable or raises `ValueError`. All checks run
+before the iterator is returned and without consuming a record, an
+empty input included. Each pull consumes exactly one record with no
+prefetch and retention stays bounded; the snapshots and rule groups
+are frozen for the batch against later commits, rollbacks, pruning,
+compaction and caller mutation. The preview is otherwise read-only,
+apart from the one legacy single-file layout migration the first
+snapshot read may perform.
 
 ## Tests
 

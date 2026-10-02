@@ -4999,6 +4999,644 @@ class MigrateStreamTests(unittest.TestCase):
         self.assertEqual(rest[0]["report"], expected[1])
 
 
+class MigratePathStreamTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.lens = Lens(self.dir.name)
+
+    def _publish(self, records, revision, **limits):
+        return _publish(self.dir.name, records, revision, **limits)
+
+    def _rename_chain(self):
+        # A field renamed a -> b -> c over three revisions.
+        self._publish([{"a": 1}], 1)
+        self._publish([{"b": 1}], 2)
+        self._publish([{"c": 1}], 3)
+        return [
+            [{"op": "rename", "path": ["a"], "to": "b"}],
+            [{"op": "rename", "path": ["b"], "to": "c"}],
+        ]
+
+    # -- basic shape -----------------------------------------------------
+
+    def test_results_have_exactly_index_report_error(self):
+        groups = self._rename_chain()
+        results = list(
+            self.lens.migrate_path_stream([{"a": 1}, {"a": 2}], [1, 2, 3], groups)
+        )
+        self.assertEqual([r["index"] for r in results], [1, 2])
+        for result in results:
+            self.assertEqual(set(result), {"index", "report", "error"})
+            self.assertIsNone(result["error"])
+
+    def test_field_renamed_twice_reaches_the_endpoint_record(self):
+        groups = self._rename_chain()
+        results = list(
+            self.lens.migrate_path_stream([{"a": 7}], [1, 2, 3], groups)
+        )
+        report = results[0]["report"]
+        self.assertEqual(
+            report["migration"],
+            {"stage": "done", "record": {"c": 7}, "reports": []},
+        )
+        self.assertEqual(
+            [s["migration"]["record"] for s in report["steps"]],
+            [{"b": 7}, {"c": 7}],
+        )
+
+    def test_report_keeps_endpoint_compat_fields_and_original_verdicts(self):
+        groups = self._rename_chain()
+        results = list(
+            self.lens.migrate_path_stream([{"a": 1}], [1, 2, 3], groups)
+        )
+        report = results[0]["report"]
+        compat = self.lens.compat(1, 3)
+        self.assertEqual(
+            set(report),
+            {"from", "to", "backward", "forward", "changes",
+             "unknown_reasons", "steps", "migration"},
+        )
+        for key in ("from", "to", "backward", "forward", "changes",
+                    "unknown_reasons"):
+            self.assertEqual(report[key], compat[key])
+
+    def test_steps_are_complete_migrate_reports_in_path_order(self):
+        groups = self._rename_chain()
+        results = list(
+            self.lens.migrate_path_stream([{"a": 1}], [1, 2, 3], groups)
+        )
+        report = results[0]["report"]
+        self.assertEqual(len(report["steps"]), 2)
+        self.assertEqual(
+            [(s["from"], s["to"]) for s in report["steps"]], [(1, 2), (2, 3)]
+        )
+        for step in report["steps"]:
+            self.assertEqual(
+                set(step),
+                {"from", "to", "backward", "forward", "changes",
+                 "unknown_reasons", "migration"},
+            )
+        self.assertEqual(
+            report["steps"][0],
+            self.lens.migrate({"a": 1}, 1, 2, groups[0]),
+        )
+        self.assertEqual(
+            report["steps"][1],
+            self.lens.migrate({"b": 1}, 2, 3, groups[1]),
+        )
+
+    def test_migration_equals_last_attempted_segments_migration(self):
+        groups = self._rename_chain()
+        results = list(
+            self.lens.migrate_path_stream([{"a": 1}], [1, 2, 3], groups)
+        )
+        report = results[0]["report"]
+        self.assertEqual(report["migration"], report["steps"][-1]["migration"])
+
+    def test_same_version_segments_still_run_rules(self):
+        self._publish([{"a": 1, "b": 2}], 1)
+        groups = [[{"op": "rename", "path": ["a"], "to": "c"}]]
+        results = list(
+            self.lens.migrate_path_stream([{"a": 1, "b": 2}], [1, 1], groups)
+        )
+        report = results[0]["report"]
+        self.assertEqual(report["from"], 1)
+        self.assertEqual(report["to"], 1)
+        self.assertEqual(report["steps"][0]["from"], 1)
+        self.assertEqual(report["steps"][0]["to"], 1)
+        # The rename makes c unexpected under revision 1's schema.
+        self.assertEqual(report["migration"]["stage"], "target")
+        self.assertTrue(report["migration"]["reports"])
+
+    def test_descending_order_repeats_and_adjacent_identical_versions(self):
+        groups = self._rename_chain()
+        back_groups = [
+            [],
+            [{"op": "rename", "path": ["c"], "to": "b"}],
+            [{"op": "rename", "path": ["b"], "to": "a"}],
+        ]
+        results = list(
+            self.lens.migrate_path_stream([{"c": 1}], [3, 3, 2, 1], back_groups)
+        )
+        report = results[0]["report"]
+        self.assertEqual(
+            [(s["from"], s["to"]) for s in report["steps"]],
+            [(3, 3), (3, 2), (2, 1)],
+        )
+        self.assertEqual(report["from"], 3)
+        self.assertEqual(report["to"], 1)
+        self.assertEqual(
+            report["migration"],
+            {"stage": "done", "record": {"a": 1}, "reports": []},
+        )
+
+    def test_each_segment_reuses_existing_migrate_semantics_with_wildcards(self):
+        self._publish([{"items": [{"x": 1}]}], 1)
+        self._publish([{"items": [{"y": 1, "t": "z"}]}], 2)
+        self._publish([{"items": [{"z": 1, "t": "z"}]}], 3)
+        groups = [
+            [{"op": "rename", "path": ["items", None, "x"], "to": "y"},
+             {"op": "default", "path": ["items", None, "t"], "value": "z"}],
+            [{"op": "rename", "path": ["items", None, "y"], "to": "z"}],
+        ]
+        results = list(
+            self.lens.migrate_path_stream(
+                [{"items": [{"x": 1}]}], [1, 2, 3], groups
+            )
+        )
+        self.assertEqual(
+            results[0]["report"]["migration"]["record"],
+            {"items": [{"z": 1, "t": "z"}]},
+        )
+
+    # -- stopping mid-path ----------------------------------------------
+
+    def test_source_stop_terminates_the_path_and_keeps_failing_step(self):
+        # Revisions 1 and 2 require a; a record without a fails step 1's
+        # source check, so step 2 must never run.
+        self._publish([{"a": 1}], 1)
+        self._publish([{"a": 1}], 2)
+        self._publish([{"b": 1}], 3)
+        step2_rules = [{"op": "rename", "path": ["a"], "to": "b"}]
+        results = list(
+            self.lens.migrate_path_stream(
+                [{"b": 1}], [1, 2, 3], [[], step2_rules]
+            )
+        )
+        report = results[0]["report"]
+        # Step 1 stops at the source check: only it is retained, with a
+        # null record, and segment 2 never runs.
+        self.assertEqual(report["migration"]["stage"], "source")
+        self.assertEqual(len(report["steps"]), 1)
+        self.assertEqual(report["steps"][0]["from"], 1)
+        self.assertIsNone(report["steps"][0]["migration"]["record"])
+
+    def test_target_stop_terminates_the_path_and_keeps_failing_step(self):
+        # A valid rev-1 record with no rules fails rev 2's required b.
+        self._publish([{"a": 1}], 1)
+        self._publish([{"b": 1}], 2)
+        self._publish([{"c": 1}], 3)
+        groups = [[], [{"op": "rename", "path": ["b"], "to": "c"}]]
+        results = list(
+            self.lens.migrate_path_stream([{"a": 1}], [1, 2, 3], groups)
+        )
+        report = results[0]["report"]
+        self.assertEqual(report["migration"]["stage"], "target")
+        self.assertEqual(len(report["steps"]), 1)
+        self.assertEqual(
+            report["migration"]["reports"],
+            self.lens.check({"a": 1}, version=2),
+        )
+        self.assertEqual(report["migration"], report["steps"][-1]["migration"])
+
+    def test_later_step_receives_the_previous_steps_migrated_record(self):
+        groups = self._rename_chain()
+        results = list(
+            self.lens.migrate_path_stream([{"a": 5}], [1, 2, 3], groups)
+        )
+        report = results[0]["report"]
+        # Step 2's source check (against revision 2, which requires b)
+        # passes precisely because it sees step 1's {"b": 5}.
+        self.assertEqual(report["steps"][1]["migration"]["stage"], "done")
+        self.assertEqual(report["steps"][1]["migration"]["record"], {"c": 5})
+
+    # -- per-record error isolation --------------------------------------
+
+    def test_non_json_records_become_errors_and_stream_continues(self):
+        groups = self._rename_chain()
+        records = [
+            {"a": 1}, {"a": {1, 2}}, {"a": float("nan")}, None, 1, "x",
+            {"a": 2},
+        ]
+        results = list(
+            self.lens.migrate_path_stream(records, [1, 2, 3], groups)
+        )
+        self.assertEqual([r["index"] for r in results], [1, 2, 3, 4, 5, 6, 7])
+        self.assertIsNone(results[0]["error"])
+        for bad in results[1:6]:
+            self.assertIsNone(bad["report"])
+            self.assertIsNotNone(bad["error"])
+        self.assertIsNone(results[6]["error"])
+
+    def test_step_rule_value_error_is_prefixed_and_isolated(self):
+        self._publish([{"a": [1]}, {"a": {"x": 1}}], 1)
+        groups = [
+            [{"op": "drop", "path": ["a", "x"]}],
+            [{"op": "drop", "path": ["a", "x"]}],
+        ]
+        # [1] passes the rev-1 source check; the null-free path "a.x" on
+        # an array makes step 1 raise. Reusing revision 1 keeps both
+        # segments on the same (frozen) snapshot.
+        results = list(
+            self.lens.migrate_path_stream(
+                [{"a": [1]}, {"a": {"x": 1}}, {"a": [1]}], [1, 1], groups[:1]
+            )
+        )
+        self.assertEqual(
+            results[0],
+            {"index": 1, "report": None,
+             "error": "step 1: string path segment requires an object"},
+        )
+        self.assertIsNone(results[1]["error"])
+        self.assertEqual(
+            results[2]["error"],
+            "step 1: string path segment requires an object",
+        )
+
+    def test_step_prefix_names_the_failing_segment(self):
+        self._publish([{"a": [1]}], 1)
+        self._publish([{"a": [1]}], 2)
+        # Step 1 carries no rules and the record passes both revs 1 and
+        # 2; step 2's null path then meets the non-array number inside a.
+        self._publish([{"a": [{"x": 1}]}], 3)
+        groups = [
+            [],
+            [{"op": "drop", "path": ["a", None, "x"]}],
+        ]
+        results = list(
+            self.lens.migrate_path_stream(
+                [{"a": [1]}], [1, 2, 2], groups
+            )
+        )
+        self.assertIsNone(results[0]["report"])
+        self.assertTrue(results[0]["error"].startswith("step 2: "))
+
+    def test_iterator_non_stopiteration_exception_propagates_verbatim(self):
+        groups = self._rename_chain()
+
+        def generate():
+            yield {"a": 1}
+            raise RuntimeError("stream broke")
+
+        stream = self.lens.migrate_path_stream(generate(), [1, 2, 3], groups)
+        self.assertEqual(next(stream)["index"], 1)
+        with self.assertRaisesRegex(RuntimeError, "stream broke"):
+            next(stream)
+
+    def test_iterator_value_error_is_not_turned_into_a_result(self):
+        groups = [[]]
+        self._publish([{"a": 1}], 1)
+
+        def generate():
+            yield {"a": 1}
+            raise ValueError("source problem")
+
+        stream = self.lens.migrate_path_stream(generate(), [1, 1], groups)
+        self.assertIsNone(next(stream)["error"])
+        with self.assertRaisesRegex(ValueError, "source problem"):
+            next(stream)
+
+    # -- eager validation, no consumption --------------------------------
+
+    def _tracking_source(self, records):
+        source = {"started": False, "records": records}
+
+        def generate():
+            source["started"] = True
+            yield from records
+
+        source["iterator_factory"] = generate
+        return source
+
+    def test_call_does_not_consume_records(self):
+        groups = self._rename_chain()
+        source = self._tracking_source([{"a": 1}])
+        results = self.lens.migrate_path_stream(
+            source["iterator_factory"](), [1, 2, 3], groups
+        )
+        self.assertFalse(source["started"])
+        first = next(results)
+        self.assertTrue(source["started"])
+        self.assertIsNone(first["error"])
+
+    def test_one_record_consumed_per_pull_without_prefetch(self):
+        self._publish([{"a": 1}], 1)
+        pulled = []
+
+        def generate():
+            for value in (1, 2, 3):
+                record = {"a": value}
+                pulled.append(record)
+                yield record
+
+        stream = self.lens.migrate_path_stream(generate(), [1, 1], [[]])
+        self.assertEqual(pulled, [])
+        next(stream)
+        self.assertEqual(len(pulled), 1)
+        next(stream)
+        self.assertEqual(len(pulled), 2)
+        next(stream)
+        self.assertEqual(len(pulled), 3)
+        with self.assertRaises(StopIteration):
+            next(stream)
+        self.assertEqual(len(pulled), 3)
+
+    def test_path_container_validation(self):
+        groups = self._rename_chain()
+        for revisions, rule_groups in (
+            ([1], []),
+            ([1, 2], [[]]),
+            ("x", []),
+            ((1, 2), [[]]),
+            ([1, 2], groups),
+            ([1, 2, 3], groups[:1]),
+            ([1, 2], "x"),
+            ([1, 2], ["x"]),
+            ([1, 2], [{"op": "drop", "path": ["a"]}]),
+        ):
+            with self.subTest(revisions=revisions, rule_groups=rule_groups):
+                with self.assertRaises(ValueError):
+                    self.lens.migrate_path_stream(None, revisions, rule_groups)
+
+    def test_illegal_rule_in_any_group_raises_without_consuming(self):
+        self._rename_chain()
+        source = self._tracking_source([{"a": 1}])
+        with self.assertRaises(ValueError):
+            self.lens.migrate_path_stream(
+                source["iterator_factory"](),
+                [1, 2, 3],
+                [[{"op": "rename", "path": ["a"], "to": "b"}],
+                 [{"op": "nope"}]],
+            )
+        self.assertFalse(source["started"])
+
+    def test_containers_validated_before_revisions_and_records(self):
+        source = self._tracking_source([{"a": 1}])
+        with self.assertRaises(ValueError):
+            self.lens.migrate_path_stream(
+                source["iterator_factory"](), [1], []
+            )
+        self.assertFalse(source["started"])
+
+    def test_bad_revisions_raise_conflict_without_consuming(self):
+        self._rename_chain()
+        for revisions in ([0, 1], [1, -1], [True, 1], [1, "2"],
+                          [1, 2, 9], [1, 2.0]):
+            source = self._tracking_source([{"a": 1}])
+            with self.subTest(revisions=revisions):
+                with self.assertRaises(SchemaConflict):
+                    self.lens.migrate_path_stream(
+                        source["iterator_factory"](),
+                        revisions,
+                        [[] for _ in range(len(revisions) - 1)],
+                    )
+                self.assertFalse(source["started"])
+
+    def test_corrupt_revision_raises_conflict_without_consuming(self):
+        self._rename_chain()
+        revision_path(self.dir.name, 2).write_text("not json", encoding="utf-8")
+        source = self._tracking_source([{"a": 1}])
+        with self.assertRaises(SchemaConflict):
+            self.lens.migrate_path_stream(
+                source["iterator_factory"](), [1, 2, 3], [[], []]
+            )
+        self.assertFalse(source["started"])
+
+    def test_each_distinct_snapshot_is_read_once_and_repeats_share_it(self):
+        groups = self._rename_chain()
+        seen = []
+        original = Lens._read_revision
+
+        def reading(lens, revision):
+            seen.append(revision)
+            return original(lens, revision)
+
+        Lens._read_revision = reading
+        try:
+            list(
+                self.lens.migrate_path_stream(
+                    [{"a": 1}], [2, 1, 2, 3, 3], [[], [], [], []]
+                )
+            )
+        finally:
+            Lens._read_revision = original
+        self.assertEqual(sorted(seen), [1, 2, 3])
+
+    def test_non_iterable_records_raise_value_error(self):
+        self._rename_chain()
+        for records in (7, 3.5, object()):
+            with self.subTest(records=records):
+                with self.assertRaises(ValueError):
+                    self.lens.migrate_path_stream(records, [1, 2], [[]])
+
+    def test_empty_input_runs_all_checks_and_yields_nothing(self):
+        groups = self._rename_chain()
+        self.assertEqual(
+            list(self.lens.migrate_path_stream([], [1, 2, 3], groups)), []
+        )
+        self.assertEqual(
+            list(self.lens.migrate_path_stream(iter([]), [1, 1], [[]])), []
+        )
+        with self.assertRaises(ValueError):
+            self.lens.migrate_path_stream([], [1, 2, 3], [[{"op": "bad"}]])
+        with self.assertRaises(SchemaConflict):
+            self.lens.migrate_path_stream([], [9, 9], [[]])
+        with self.assertRaises(ValueError):
+            self.lens.migrate_path_stream([], [1], [])
+        with self.assertRaises(ValueError):
+            self.lens.migrate_path_stream(42, [1, 1], [[]])
+
+    # -- freezing, independence, streaming memory ------------------------
+
+    def test_snapshots_survive_compaction_between_pulls(self):
+        lens = _build_history(self.dir.name, 5, compact_keep=2)
+        other = Lens(self.dir.name)
+        records = [{"f0": 0, "shared": "s"}, {"f2": 2, "shared": "s"}]
+        # A path that revises 1 -> 3 (baseline after compaction) -> 4
+        # with no rules; the published histories fold f{i} as required,
+        # so each step lands at target for these records - we only need
+        # the frozen snapshots to keep answering.
+        expected_first = (
+            list(other.migrate_path_stream([records[0]], [1, 3, 4], [[], []]))
+            [0]["report"]
+        )
+        stream = lens.migrate_path_stream(iter(records), [1, 3, 4], [[], []])
+        first = next(stream)["report"]
+        self.assertEqual(first, expected_first)
+        self.assertEqual(lens.compact(), {"anchor": 3, "merged": [1, 2, 3]})
+        with self.assertRaises(SchemaConflict):
+            lens.migrate_path_stream([records[0]], [1, 3], [[]])
+        rest = list(stream)
+        self.assertEqual(len(rest), 1)
+        anchor = list(
+            lens.migrate_path_stream(
+                [{"f2": 2, "shared": "s"}], [3, 4], [[]]
+            )
+        )
+        self.assertEqual(anchor[0]["report"]["steps"][-1]["migration"]["stage"],
+                         "done")
+
+    def test_caller_mutating_path_inputs_after_call_does_not_change_batch(self):
+        groups = self._rename_chain()
+        records = [{"a": 1}, {"a": 2}]
+        expected = [
+            list(self.lens.migrate_path_stream([r], [1, 2, 3], groups))[0]["report"]
+            for r in records
+        ]
+        revisions = [1, 2, 3]
+        stream = self.lens.migrate_path_stream(
+            iter(records), revisions, copy.deepcopy(groups)
+        )
+        first = next(stream)
+        revisions.append(999)
+        revisions[0] = 9
+        groups[0][0]["to"] = "zzz"
+        groups.append([{"op": "drop", "path": ["a"]}])
+        self.assertEqual(first["report"], expected[0])
+        self.assertEqual(next(stream)["report"], expected[1])
+
+    def test_commit_after_return_does_not_change_results(self):
+        groups = self._rename_chain()
+        records = [{"a": 1}, {"a": 2}]
+        expected = [
+            list(self.lens.migrate_path_stream([r], [1, 2, 3], groups))[0]["report"]
+            for r in records
+        ]
+        stream = self.lens.migrate_path_stream(iter(records), [1, 2, 3], groups)
+        first = next(stream)
+        self._publish([{"q": 1}], 4)
+        rest = list(stream)
+        self.assertEqual(first["report"], expected[0])
+        self.assertEqual(rest[0]["report"], expected[1])
+
+    def test_input_records_are_not_modified(self):
+        groups = self._rename_chain()
+        records = [{"a": 1}, {"a": 2}]
+        originals = copy.deepcopy(records)
+        list(self.lens.migrate_path_stream(records, [1, 2, 3], groups))
+        self.assertEqual(records, originals)
+
+    def test_returned_records_are_independent_of_inputs_defaults_and_each_other(self):
+        self._publish(
+            [{"items": [{"x": 1, "tags": ["t"]}, {"x": 2}]}], 1
+        )
+        # Revision 2 always carries the tags array; step 1 defaults it
+        # and step 2 is a same-version segment that just re-checks.
+        self._publish(
+            [{"items": [{"x": 1, "tags": ["t"]}, {"x": 2, "tags": ["t"]}]}], 2
+        )
+        default_value = ["t"]
+        groups = [
+            [{"op": "default", "path": ["items", None, "tags"],
+              "value": default_value}],
+            [],
+        ]
+        inputs = [{"items": [{"x": 1}]}, {"items": [{"x": 2}]}]
+        stream = self.lens.migrate_path_stream(iter(inputs), [1, 2, 2], groups)
+        first = next(stream)["report"]["migration"]["record"]
+        first["items"][0]["tags"].append("u")
+        second = next(stream)["report"]["migration"]["record"]
+        self.assertEqual(second["items"][0]["tags"], ["t"])
+        self.assertEqual(default_value, ["t"])
+        self.assertEqual(inputs[0], {"items": [{"x": 1}]})
+
+    def test_mutating_one_result_never_affects_later_results(self):
+        self._publish([{"a": 1}], 1)
+        stream = self.lens.migrate_path_stream(
+            iter([{"a": 1}, {"a": 2}]), [1, 1], [[]]
+        )
+        first = next(stream)
+        first["report"]["migration"]["record"]["a"] = 999
+        first["report"]["steps"][0]["migration"]["reports"].append("tampered")
+        second = next(stream)
+        self.assertEqual(
+            second["report"]["migration"]["record"], {"a": 2}
+        )
+        self.assertEqual(second["report"]["steps"][0]["migration"]["reports"], [])
+
+    def test_processed_records_are_not_retained(self):
+        import gc
+        import weakref
+
+        self._publish([{"a": 1}], 1)
+
+        class Record(dict):
+            """A dict subclass so weak references to records are possible."""
+
+        refs: list = []
+
+        def generate():
+            for index in range(50):
+                record = Record(a=index)
+                refs.append(weakref.ref(record))
+                yield record
+
+        stream = self.lens.migrate_path_stream(generate(), [1, 1], [[]])
+        last = next(stream)
+        for _ in range(49):
+            last = next(stream)
+        gc.collect()
+        self.assertTrue(all(ref() is None for ref in refs[:-1]))
+        self.assertIsNotNone(refs[-1]())
+
+    def test_large_stream_keeps_continuous_indices(self):
+        self._publish([{"a": 1}], 1)
+        count = 20000
+
+        def generate():
+            for index in range(count):
+                yield {"a": index}
+
+        stream = self.lens.migrate_path_stream(generate(), [1, 1, 1], [[], []])
+        last = None
+        for consumed, result in enumerate(stream, 1):
+            last = result
+            self.assertEqual(result["index"], consumed)
+        self.assertEqual(last["index"], count)
+
+    def test_repeated_streams_are_stable(self):
+        groups = self._rename_chain()
+        records = [{"a": 1}, {"a": 2}]
+        first = [
+            json.dumps(r, sort_keys=True)
+            for r in self.lens.migrate_path_stream(records, [1, 2, 3], groups)
+        ]
+        for _ in range(3):
+            again = [
+                json.dumps(r, sort_keys=True)
+                for r in self.lens.migrate_path_stream(records, [1, 2, 3], groups)
+            ]
+            self.assertEqual(again, first)
+
+    # -- state and persistence guarantees --------------------------------
+
+    def test_legacy_single_file_migrates_on_first_read(self):
+        folder = Lens(tempfile.mkdtemp())
+        folder.infer([{"a": 1}])
+        root = folder.schema()
+        from schema_lens.core import _checksum
+
+        legacy = Path(self.dir.name, SCHEMA_FILENAME)
+        legacy.write_text(
+            json.dumps({"version": 2, "checksum": _checksum(root), "root": root})
+        )
+        lens = Lens(self.dir.name)
+        results = lens.migrate_path_stream([{"a": 1}], [1, 1], [[]])
+        self.assertEqual(lens.versions(), [1])
+        self.assertFalse(legacy.exists())
+        self.assertEqual(
+            next(results)["report"]["migration"]["stage"], "done"
+        )
+
+    def test_open_snapshot_batches_and_files_are_untouched(self):
+        groups = self._rename_chain()
+        self.lens.load()
+        self.lens.infer([{"pending": 1}])
+        snapshot = self.lens.schema()
+        versions_dir = Path(self.dir.name, VERSIONS_DIRNAME)
+        before = sorted(os.listdir(versions_dir))
+        list(
+            self.lens.migrate_path_stream(
+                [{"a": 1}, "bad"], [1, 2, 3], groups
+            )
+        )
+        self.assertEqual(self.lens.schema(), snapshot)
+        self.assertEqual(self.lens.check({"pending": 1}), [])
+        self.assertEqual(self.lens.versions(), [1, 2, 3])
+        self.assertEqual(sorted(os.listdir(versions_dir)), before)
+
+
 if __name__ == "__main__":
     unittest.main()
 
