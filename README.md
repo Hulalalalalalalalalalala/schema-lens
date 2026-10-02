@@ -41,6 +41,7 @@ committed revision; without it they use the snapshot loaded at open time.
 - `compat_witness(old_revision, new_revision) -> dict` returns the same report as `compat` plus a `witnesses` object with a concrete, `check`-verified counterexample for each breaking direction (`null` for compatible/unknown, both `null` on a self-comparison), without changing memory or any revision.
 - `compat_matrix(revisions=None) -> dict` reads committed snapshots for every revision (or a strictly increasing selection) and reports both directional verdicts for every ordered pair, self-comparisons included, in one matrix.
 - `migrate(record, old_revision, new_revision, rules) -> dict` returns the `compat` report for the pair plus a `migration` object previewing an explicit field-level migration of one JSON object: check against the old revision, apply the rename/drop/default rules in order, check against the new revision. Read-only like `compat`.
+- `migrate_roundtrip(record, old_revision, new_revision, rules, rollback_rules) -> dict` returns the full `migrate` report plus a `rollback` object (`null` when the forward preview does not finish) confirming whether the rollback rules restore the original record, including every path that differs when they do not. Read-only like `migrate`.
 - `stats() -> dict` reports fields, optional fields, observed types and observation counts.
 - `SchemaConflict` exported exception.
 
@@ -451,6 +452,60 @@ entry points. Nothing else is written and nothing shared is mutated:
 the input record and rules, the open snapshot, uncommitted batches and
 every committed revision are exactly as they were, and the same input
 always returns the same content in the same order.
+
+## Migration roundtrip rehearsal
+
+`migrate_roundtrip(record, old_revision, new_revision, rules,
+rollback_rules)` (Python only) runs the migration preview above and then
+rehearses the reverse journey, so the migration can be confirmed as
+recoverable before it is applied. It returns the complete `migrate`
+report unchanged, with one `rollback` object appended:
+
+```json
+{
+  "from": 1, "to": 2,
+  "backward": "compatible", "forward": "breaking",
+  "changes": [{"path": "$.c", "change": "field_added", "breaking": false}],
+  "unknown_reasons": [],
+  "migration": {"stage": "done", "record": {"a": 1, "c": "x"}, "reports": []},
+  "rollback": {"stage": "done", "record": {"a": 1, "b": "x"},
+               "reports": [], "differences": []}
+}
+```
+
+`rollback_rules` is a rule list with the same rename/drop/default ops
+and path semantics as `rules`, validated and applied in its own order;
+both rule lists (and the record and revisions) are validated completely
+before any rule runs, so an invalid rollback rule raises `ValueError`
+even when the forward source check would fail. When the forward preview
+fails at the source or target check, `migration` is exactly what
+`migrate` returns and `rollback` is `null` - rollback rules never run on
+a migration that did not finish.
+
+Only after a successful migration do the rollback rules run, on the
+migrated record, and the recovered record is then checked against the
+old revision. When that check fails, `stage` is `"target"`, `record` is
+`null`, `reports` is the full list the old revision's `check` returns
+and `differences` is `[]`. When the check passes, `reports` is `[]` and
+`record` is the recovered record; `stage` is `"done"` when it equals the
+original record and `"different"` otherwise, with `differences` listing
+every path that differs.
+
+The recovery comparison walks the records' actual data regardless of
+approximate schema branches (which are still judged by `check`): objects
+ignore key order and compare key by key, equal-length arrays compare by
+index, a missing key records that field's path, and a type change, an
+array-length change or an unequal scalar records only the current
+position without expanding it. A missing field and `null` are distinct,
+as are booleans and numbers; integers and floats compare by numeric
+value. Paths reuse `check`'s field references and array indices
+(`$["a.b"]` for a dotted name, `$.items[0].x` for an indexed field),
+are de-duplicated and sorted ascending. Migrating between a revision and
+itself still applies both rule lists and runs every check. The rehearsal
+is read-only and deterministic exactly like `migrate`: no input,
+snapshot, pending batch, revision or history (beyond the existing legacy
+single-file migration) is written, and repeated calls return identical
+content and order.
 
 ## Tests
 

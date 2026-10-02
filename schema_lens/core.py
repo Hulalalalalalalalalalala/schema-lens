@@ -120,6 +120,28 @@ every element of an array. Like ``compat`` it only reads committed
 snapshots: the input record, the rules, the open snapshot, uncommitted
 batches and every committed revision are left untouched, and the same
 input always yields the same content and order.
+
+``migrate_roundtrip(record, old_revision, new_revision, rules,
+rollback_rules)`` runs that preview and then rehearses the reverse
+journey. The return object keeps the ``migrate`` report verbatim and
+adds one ``rollback`` object. A preview that stops at the source or
+target check yields ``rollback`` of ``null``; after a successful
+migration the rollback rules (the same ops and path semantics, applied
+in their own order) run on the migrated record and the result is checked
+against the old revision. A failed old-schema check gives ``"target"``
+with a ``null`` record, the complete ``check`` report list and no
+differences; a passing check returns the recovered record with an empty
+report list, stage ``"done"`` when it equals the original and
+``"different"`` otherwise, listing every differing path. The equality
+walk covers the records' actual data even under approximate schemas:
+objects compare key by key ignoring key order, equal-length arrays by
+index, missing keys record their field path, and a type change, length
+change or scalar inequality records only the current position; missing
+and ``null`` and booleans and numbers stay distinct while ints and
+floats compare numerically. The record and both rule lists are
+validated in full before any rule runs, so an invalid rollback rule
+raises even when the forward check fails. It is otherwise as read-only
+and deterministic as ``migrate``.
 """
 
 from __future__ import annotations
@@ -1216,10 +1238,12 @@ def _require_json_value(value: Any, what: str) -> None:
     raise ValueError(f"{what} must be a JSON value")
 
 
-def _parse_migration_rules(rules: Any) -> list[dict]:
+def _parse_migration_rules(rules: Any, label: str = "migration") -> list[dict]:
     """Validate the rule list structurally before anything is applied.
 
-    Every rule must be a JSON object carrying exactly the keys its op
+    ``label`` names the rule group in error messages (``"migration"`` for
+    the forward rules, ``"rollback"`` for the roundtrip rules). Every rule
+    must be a JSON object carrying exactly the keys its op
     needs - ``op`` and ``path`` for all three, ``to`` for rename,
     ``value`` for default - with a non-empty path of string/null segments
     ending in a string, a string rename target distinct from the source
@@ -1227,13 +1251,13 @@ def _parse_migration_rules(rules: Any) -> list[dict]:
     ``ValueError`` raised before any revision is read or any rule runs.
     """
     if not isinstance(rules, list):
-        raise ValueError("migration rules must be a JSON array")
+        raise ValueError(f"{label} rules must be a JSON array")
     for index, rule in enumerate(rules):
         if not isinstance(rule, dict):
-            raise ValueError(f"migration rule {index} must be a JSON object")
+            raise ValueError(f"{label} rule {index} must be a JSON object")
         op = rule.get("op")
         if op not in _MIGRATION_OPS:
-            raise ValueError(f"migration rule {index}: unknown op {op!r}")
+            raise ValueError(f"{label} rule {index}: unknown op {op!r}")
         path = rule.get("path")
         if (
             not isinstance(path, list)
@@ -1244,26 +1268,26 @@ def _parse_migration_rules(rules: Any) -> list[dict]:
             )
             or not isinstance(path[-1], str)
         ):
-            raise ValueError(f"migration rule {index}: invalid path")
+            raise ValueError(f"{label} rule {index}: invalid path")
         expected = {"op", "path"}
         if op == "rename":
             expected.add("to")
         elif op == "default":
             expected.add("value")
         if set(rule) != expected:
-            raise ValueError(f"migration rule {index}: invalid keys for {op}")
+            raise ValueError(f"{label} rule {index}: invalid keys for {op}")
         if op == "rename":
             if not isinstance(rule["to"], str):
                 raise ValueError(
-                    f"migration rule {index}: rename target must be a string"
+                    f"{label} rule {index}: rename target must be a string"
                 )
             if rule["to"] == path[-1]:
                 raise ValueError(
-                    f"migration rule {index}: rename target equals the "
+                    f"{label} rule {index}: rename target equals the "
                     "source field"
                 )
         elif op == "default":
-            _require_json_value(rule["value"], f"migration rule {index} value")
+            _require_json_value(rule["value"], f"{label} rule {index} value")
     return rules
 
 
@@ -1323,6 +1347,135 @@ def _apply_migration_rule(record: dict, rule: dict) -> None:
         # a value and is never replaced.
         elif last not in container:
             container[last] = copy.deepcopy(rule["value"])
+
+
+# -- roundtrip recovery comparison -------------------------------------------
+#
+# After the rollback rules run, the recovered record is compared with the
+# original field for field, independently of the schema: approximate modes
+# are still judged by ``check`` (the target check reports them like every
+# other), but equality covers every value the records actually carry. Key
+# order is ignored and objects compare key by key; equal-length arrays
+# compare element by element. A missing key records that field's path; a
+# type mismatch, unequal array length or unequal scalar records only the
+# current position and never expands it. Missing and ``null`` stay
+# distinct, as do booleans and numbers, while ints and floats compare by
+# numeric value. Paths reuse the field-reference (``_join``) and array
+# index (``[i]``) rendering ``check`` uses, de-duplicated and sorted.
+
+
+def _json_scalar_equal(left: Any, right: Any) -> bool:
+    """Whether two JSON scalars of the same kind are equal.
+
+    Numbers compare numerically so ``1`` and ``1.0`` are equal; every
+    other kind compares exactly, keeping ``True`` distinct from ``1`` and
+    ``None`` distinct from a missing key (handled by the caller).
+    """
+    if isinstance(left, (int, float)) and not isinstance(left, bool):
+        return left == right
+    return left == right
+
+
+def _collect_differences(left: Any, right: Any, path: str, out: set[str]) -> None:
+    if isinstance(left, dict):
+        if not isinstance(right, dict):
+            out.add(path)
+            return
+        for name in left:
+            if name not in right:
+                out.add(_join(path, name))
+                continue
+            _collect_differences(left[name], right[name], _join(path, name), out)
+        for name in right:
+            if name not in left:
+                out.add(_join(path, name))
+        return
+    if isinstance(left, list):
+        if not isinstance(right, list) or len(left) != len(right):
+            out.add(path)
+            return
+        for index, (le, re) in enumerate(zip(left, right)):
+            _collect_differences(le, re, f"{path}[{index}]", out)
+        return
+    # Kinds are compared before values: a boolean and a number differ even
+    # though ``True == 1`` in Python, while ints and floats share the
+    # number kind and compare numerically.
+    if _kind_of(left) != _kind_of(right) or not _json_scalar_equal(left, right):
+        out.add(path)
+
+
+def _record_differences(original: Any, recovered: Any) -> list[str]:
+    """All differing paths between two JSON values, de-duplicated and sorted.
+
+    A ``bool``/number and number/number distinction cannot be decided by a
+    naive ``isinstance`` order, so kinds are compared first and only then
+    the value, keeping ``True`` different from ``1`` while treating
+    ``1`` and ``1.0`` as the same number.
+    """
+    differences: set[str] = set()
+    _collect_differences(original, recovered, "$", differences)
+    return sorted(differences)
+
+
+def _migration_compat_report(
+    old_revision: int, new_revision: int, old_root: dict, new_root: dict
+) -> dict:
+    """The ``compat`` report for a migration pair (self-pairs compatible)."""
+    if old_revision == new_revision:
+        return {
+            "from": old_revision,
+            "to": new_revision,
+            "backward": _COMPATIBLE,
+            "forward": _COMPATIBLE,
+            "changes": [],
+            "unknown_reasons": [],
+        }
+    return _compat_report(old_revision, new_revision, old_root, new_root)
+
+
+def _validate_revision_pair(old_revision: Any, new_revision: Any) -> None:
+    if (
+        isinstance(old_revision, bool)
+        or not isinstance(old_revision, int)
+        or old_revision < 1
+        or isinstance(new_revision, bool)
+        or not isinstance(new_revision, int)
+        or new_revision < 1
+    ):
+        raise SchemaConflict(
+            f"unknown schema revision: {old_revision!r}, {new_revision!r}"
+        )
+
+
+def _run_migration_preview(
+    record: dict,
+    old_revision: int,
+    new_revision: int,
+    rules: list,
+    old_root: dict,
+    new_root: dict,
+) -> tuple[dict, dict, dict | None]:
+    """Run the check/transform/check preview on a deep-copied record.
+
+    Returns the pair's compat report, the ``migration`` object and, when
+    the migration finished (both checks passed), the complete migrated
+    record so a roundtrip can continue from it; ``None`` otherwise. The
+    caller's record is never mutated.
+    """
+    report = _migration_compat_report(old_revision, new_revision, old_root, new_root)
+    migrated = copy.deepcopy(record)
+    source_reports = _check_against(old_root, migrated)
+    if source_reports:
+        migration = {"stage": "source", "record": None, "reports": source_reports}
+        return report, migration, None
+    for rule in rules:
+        _apply_migration_rule(migrated, rule)
+    target_reports = _check_against(new_root, migrated)
+    if target_reports:
+        migration = {"stage": "target", "record": None, "reports": target_reports}
+        return report, migration, None
+    migration = {"stage": "done", "record": migrated, "reports": []}
+    return report, migration, migrated
 
 
 def _normalize_overflow_names(node: Any) -> None:
@@ -2018,17 +2171,7 @@ class Lens:
         every committed revision are exactly as they were, and the same
         input always returns the same content in the same order.
         """
-        if (
-            isinstance(old_revision, bool)
-            or not isinstance(old_revision, int)
-            or old_revision < 1
-            or isinstance(new_revision, bool)
-            or not isinstance(new_revision, int)
-            or new_revision < 1
-        ):
-            raise SchemaConflict(
-                f"unknown schema revision: {old_revision!r}, {new_revision!r}"
-            )
+        _validate_revision_pair(old_revision, new_revision)
         if not isinstance(record, dict):
             raise ValueError("record must be a JSON object")
         _require_json_value(record, "record")
@@ -2039,34 +2182,97 @@ class Lens:
             if old_revision == new_revision
             else self._read_revision(new_revision)
         )
-        if old_revision == new_revision:
-            report: dict[str, Any] = {
-                "from": old_revision,
-                "to": new_revision,
-                "backward": _COMPATIBLE,
-                "forward": _COMPATIBLE,
-                "changes": [],
-                "unknown_reasons": [],
+        report, migration, _migrated = _run_migration_preview(
+            record, old_revision, new_revision, parsed_rules, old_root, new_root
+        )
+        return {**report, "migration": migration}
+
+    def migrate_roundtrip(
+        self,
+        record: Any,
+        old_revision: int,
+        new_revision: int,
+        rules: list,
+        rollback_rules: list,
+    ) -> dict:
+        """Preview a migration and whether its result rolls back intact.
+
+        Everything :meth:`migrate` does happens first, exactly as it does
+        there - same revisions, rules, checks and report - and the returned
+        object preserves that report in full, appending only one
+        ``rollback`` object with ``stage``, ``record``, ``reports`` and
+        ``differences`` keys. The record, both rule lists and the two
+        revisions are validated completely before any rule runs, so an
+        invalid rollback rule raises even when the forward preview's
+        source check would fail.
+
+        When the forward migration does not finish (a failing source or
+        target check) ``rollback`` is ``null`` and ``migration`` is exactly
+        what :meth:`migrate` returns. When it does, the rollback rules -
+        the same rename/drop/default ops with the same path semantics,
+        applied in their own order - run on the migrated record, and the
+        recovered record is checked against the old revision. A failing
+        old-schema check gives ``stage`` ``"target"``, ``record`` ``null``,
+        ``reports`` exactly the full list the old revision's
+        :meth:`check` returns and ``differences`` an empty array. When the
+        check passes ``reports`` is empty; ``stage`` is ``"done"`` with
+        the recovered record when it equals the original and ``"different"``
+        otherwise, in which case ``record`` is still the recovered record
+        and ``differences`` lists every differing path.
+
+        The recovery comparison covers the records' actual data regardless
+        of approximated schema branches: objects ignore key order and
+        compare key by key (a missing key records that field's path),
+        equal-length arrays compare by index, and a type mismatch,
+        differing array length or unequal scalar records only that
+        position. Missing and ``null`` stay distinct, booleans and numbers
+        stay distinct, ints and floats compare by numeric value, and the
+        paths reuse ``check``'s field and index rendering, de-duplicated
+        and sorted ascending. A self-migration applies both rule lists and
+        runs every check. Read-only guarantees match :meth:`migrate`.
+        """
+        _validate_revision_pair(old_revision, new_revision)
+        if not isinstance(record, dict):
+            raise ValueError("record must be a JSON object")
+        _require_json_value(record, "record")
+        # Both rule lists are validated structurally before a revision is
+        # read or a rule runs, so an illegal rollback rule can never be
+        # hidden behind a failing forward check.
+        parsed_rules = _parse_migration_rules(rules)
+        parsed_rollback_rules = _parse_migration_rules(
+            rollback_rules, label="rollback"
+        )
+        old_root = self._read_revision(old_revision)
+        new_root = (
+            old_root
+            if old_revision == new_revision
+            else self._read_revision(new_revision)
+        )
+        report, migration, migrated = _run_migration_preview(
+            record, old_revision, new_revision, parsed_rules, old_root, new_root
+        )
+        if migrated is None:
+            return {**report, "migration": migration, "rollback": None}
+        recovered = copy.deepcopy(migrated)
+        for rule in parsed_rollback_rules:
+            _apply_migration_rule(recovered, rule)
+        target_reports = _check_against(old_root, recovered)
+        if target_reports:
+            rollback = {
+                "stage": "target",
+                "record": None,
+                "reports": target_reports,
+                "differences": [],
             }
         else:
-            report = _compat_report(old_revision, new_revision, old_root, new_root)
-        migrated = copy.deepcopy(record)
-        source_reports = _check_against(old_root, migrated)
-        if source_reports:
-            migration = {"stage": "source", "record": None, "reports": source_reports}
-        else:
-            for rule in parsed_rules:
-                _apply_migration_rule(migrated, rule)
-            target_reports = _check_against(new_root, migrated)
-            if target_reports:
-                migration = {
-                    "stage": "target",
-                    "record": None,
-                    "reports": target_reports,
-                }
-            else:
-                migration = {"stage": "done", "record": migrated, "reports": []}
-        return {**report, "migration": migration}
+            differences = _record_differences(record, recovered)
+            rollback = {
+                "stage": "different" if differences else "done",
+                "record": recovered,
+                "reports": [],
+                "differences": differences,
+            }
+        return {**report, "migration": migration, "rollback": rollback}
 
     def stats(self) -> dict:
         """Report fields, optional fields, observed types and counts.
