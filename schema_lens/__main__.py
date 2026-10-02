@@ -70,18 +70,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "command",
         choices=["infer", "check", "show", "versions", "rollback", "compact",
-                 "status", "compat", "matrix"],
+                 "status", "compat", "witness", "matrix"],
     )
     parser.add_argument(
         "target",
         nargs="?",
         help="JSONL records file (infer/check), revision number (rollback) "
-             "or old revision number (compat)",
+             "or old revision number (compat/witness)",
     )
     parser.add_argument(
         "target2",
         nargs="?",
-        help="new revision number (compat only)",
+        help="new revision number (compat/witness only)",
     )
     parser.add_argument(
         "--revisions",
@@ -143,14 +143,16 @@ def main(argv: list[str] | None = None) -> int:
             # An empty value stays an empty selection so the lens reports
             # the same ValueError the public method raises.
             matrix_revisions = []
-    if args.command == "compat":
+    if args.command in ("compat", "witness"):
         if args.target is None or args.target2 is None:
-            return fail("compat requires two revision numbers: <old> <new>")
+            return fail(
+                f"{args.command} requires two revision numbers: <old> <new>"
+            )
         try:
             compat_old = int(args.target)
             compat_new = int(args.target2)
         except ValueError:
-            return fail("compat revisions must be integers")
+            return fail(f"{args.command} revisions must be integers")
     else:
         if args.target2 is not None:
             return fail("only compat takes two positional arguments")
@@ -207,6 +209,11 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "compat":
             report = lens.compat(compat_old, compat_new)
+            json.dump(report, sys.stdout, indent=2, sort_keys=True)
+            sys.stdout.write("\n")
+            return 0
+        if args.command == "witness":
+            report = lens.compat_witness(compat_old, compat_new)
             json.dump(report, sys.stdout, indent=2, sort_keys=True)
             sys.stdout.write("\n")
             return 0

@@ -90,6 +90,19 @@ Every ordered pair, self-comparisons included, appears sorted by
 ``from`` then ``to`` with its own two directional verdicts, so upgrade and
 rollback risks sit side by side. It only reads committed snapshots, never
 infers, saves, rolls back, compacts or changes the open snapshot.
+
+``compat_witness(old, new)`` is the compat analysis with one extra
+``witnesses`` object: for every direction judged ``breaking`` it supplies a
+concrete counterexample - a JSON record the accepting revision's
+``check`` accepts with an empty report list and the exact, non-empty
+report list the rejecting revision's ``check`` returns for it (for
+backward, the record passes old and fails new; forward swaps them). A
+``compatible`` or ``unknown`` direction yields ``null``, and both are
+``null`` for a self-comparison. Counterexamples are built straight from
+the accepting revision's tree while the symmetric diff walks it and are
+verified through ``check`` itself, so an unknowable approximate branch
+never gets a fabricated witness; every record, key order and report list
+is stable for the same pair. Like ``compat`` it is read-only.
 """
 
 from __future__ import annotations
@@ -648,6 +661,14 @@ _COMPATIBLE = "compatible"
 _BREAKING = "breaking"
 _UNKNOWN = "unknown"
 
+# Witness recipe step tags (see ``_CompatDiffer``): an object field
+# descent, one array-element nesting, a forced-kind leaf, and an omission
+# of the innermost field.
+_FIELD = "f"
+_ARRAY = "a"
+_KIND = "k"
+_MISSING = "m"
+
 
 def _combine_pair(pair: tuple[str, str], other: tuple[str, str]) -> tuple[str, str]:
     return (_worst(pair[0], other[0]), _worst(pair[1], other[1]))
@@ -690,6 +711,36 @@ class _CompatDiffer:
     def __init__(self) -> None:
         self.changes: list[dict] = []
         self.reasons: set[str] = set()
+        # One deterministic witness recipe per breaking pair position. Each
+        # recipe is a tuple of tagged steps from the root object to that
+        # position, so a record can be built straight from a schema tree
+        # without matching change strings, re-deriving the alignment, or
+        # risking a collision between a real field name and a step token:
+        # ``("f", name)`` descends through an object field, ``("a",)``
+        # through one array element nesting, and the terminal step is
+        # either ``("k", kind)`` (force a value of that kind) or
+        # ``("m",)`` (omit the innermost field).
+        self.recipes: list[tuple[str, tuple]] = []
+        self._steps: list[tuple] = []
+
+    @contextlib.contextmanager
+    def _step(self, step: tuple) -> Iterator[None]:
+        self._steps.append(step)
+        try:
+            yield
+        finally:
+            self._steps.pop()
+
+    def witness(self, direction: str, terminal: tuple) -> None:
+        """Record a witness recipe for one breaking pair position.
+
+        ``direction`` names the accepting (record) side for the breaking
+        direction being witnessed (``"old"`` for a backward-breaking
+        position, ``"new"`` for a forward-breaking one); ``terminal`` is
+        the recipe's terminal step. Every call site is a non-collapsed
+        exact branch the accepting side demonstrably accepts.
+        """
+        self.recipes.append((direction, tuple(self._steps) + (terminal,)))
 
     def diff(self, old_root: dict, new_root: dict) -> dict:
         backward, forward = self.compare_object(old_root, new_root, "$")
@@ -722,9 +773,9 @@ class _CompatDiffer:
             old_entry = old_fields.get(name)
             new_entry = new_fields.get(name)
             if old_entry is not None and new_entry is not None:
-                verdict = _combine_pair(
-                    verdict, self.compare_entry(old_entry, new_entry, field_path)
-                )
+                with self._step((_FIELD, name)):
+                    pair = self.compare_entry(old_entry, new_entry, field_path)
+                verdict = _combine_pair(verdict, pair)
             elif old_entry is not None:
                 # The field disappears from the new exact fields. New check
                 # only accepts it when the name really folded into the new
@@ -737,6 +788,17 @@ class _CompatDiffer:
                     # omitting it additionally fail an old required field
                     # under the forward direction.
                     self.change(field_path, "field_removed", True)
+                    with self._step((_FIELD, name)):
+                        # A legal new record omits it; the old
+                        # required-field check reports it missing. That
+                        # witness needs no value kind.
+                        if not old_entry["optional"]:
+                            self.witness("new", (_MISSING,))
+                        kind = self._witness_present_kind(old_entry)
+                        if kind is not None:
+                            # A legal old record carries the field; new
+                            # check reports it as unexpected.
+                            self.witness("old", (_KIND, kind))
                     verdict = _combine_pair(
                         verdict,
                         (_BREAKING,
@@ -756,6 +818,16 @@ class _CompatDiffer:
                     self.change(
                         field_path, "field_added", not new_entry["optional"]
                     )
+                    with self._step((_FIELD, name)):
+                        # A legal old record omits it; the new
+                        # required-field check reports it missing.
+                        if not new_entry["optional"]:
+                            self.witness("old", (_MISSING,))
+                        kind = self._witness_present_kind(new_entry)
+                        if kind is not None:
+                            # A legal new record carries the field; old
+                            # check reports it as unexpected.
+                            self.witness("new", (_KIND, kind))
                     verdict = _combine_pair(
                         verdict,
                         (_BREAKING if not new_entry["optional"] else _COMPATIBLE,
@@ -770,6 +842,21 @@ class _CompatDiffer:
                 verdict = _combine_pair(verdict, (_UNKNOWN, _UNKNOWN))
         return verdict
 
+    @staticmethod
+    def _witness_present_kind(entry: dict) -> str | None:
+        """Deterministic kind a legal record uses for this exact entry.
+
+        Exact field entries compared here are never approximate, and a
+        validated entry has observed at least one record, so its type set
+        is non-empty. The fixed kind order (null, boolean, number, string,
+        array, object) makes the choice independent of dict iteration
+        order; scalars are preferred and an array precedes an object.
+        """
+        for kind in _KINDS:
+            if kind in entry["types"]:
+                return kind
+        return None
+
     def compare_entry(
         self, old: dict, new: dict, path: str
     ) -> tuple[str, str]:
@@ -782,12 +869,16 @@ class _CompatDiffer:
         verdict = _COMPATIBLE, _COMPATIBLE
         if old["optional"] != new["optional"]:
             if old["optional"]:
-                # Optional becomes required: old records may omit it.
+                # Optional becomes required: old records may omit it. The
+                # field name is the current innermost step; the missing
+                # witness omits exactly that field.
                 self.change(path, "optional_to_required", True)
+                self.witness("old", (_MISSING,))
                 verdict = (_BREAKING, _COMPATIBLE)
             else:
                 # Required becomes optional: new records may omit it.
                 self.change(path, "required_to_optional", False)
+                self.witness("new", (_MISSING,))
                 verdict = (_COMPATIBLE, _BREAKING)
         verdict = _combine_pair(
             verdict, self.compare_types(old["types"], new["types"], path, "type")
@@ -809,14 +900,17 @@ class _CompatDiffer:
                 )
             elif old_node is not None:
                 # Records of this kind are legal on the old side but the
-                # new type set no longer contains it (narrowing).
+                # new type set no longer contains it (narrowing). A record
+                # forcing exactly this kind is the backward witness.
                 self.change(path, f"{prefix}_{kind}_removed", True)
+                self.witness("old", (_KIND, kind))
                 verdict = _combine_pair(verdict, (_BREAKING, _COMPATIBLE))
             else:
                 # The new side widened with this kind; old check rejects
                 # new records that take it (forward breaking), while old
                 # records still pass the new, wider check.
                 self.change(path, f"{prefix}_{kind}_added", False)
+                self.witness("new", (_KIND, kind))
                 verdict = _combine_pair(verdict, (_COMPATIBLE, _BREAKING))
         return verdict
 
@@ -840,7 +934,9 @@ class _CompatDiffer:
         even for a depth-capped array - only a collapsed *child* hides
         structure. So scalar element kinds gate exactly (rendered as
         ``path[]``) and collapsed element objects taint beneath them;
-        element objects then join fields normally (``path[].name``).
+        element objects then join fields normally (``path[].name``). The
+        matching array-level step marks the one nesting level check
+        descends through per element.
         """
         element_path = f"{path}[]"
         verdict = _COMPATIBLE, _COMPATIBLE
@@ -850,14 +946,18 @@ class _CompatDiffer:
             old_child = old["elements"].get(kind)
             new_child = new["elements"].get(kind)
             if old_child is not None and new_child is not None:
-                verdict = _combine_pair(
-                    verdict, self.compare_kind(old_child, new_child, element_path)
-                )
+                with self._step((_ARRAY,)):
+                    pair = self.compare_kind(old_child, new_child, element_path)
+                verdict = _combine_pair(verdict, pair)
             elif old_child is not None:
                 self.change(element_path, f"element_type_{kind}_removed", True)
+                with self._step((_ARRAY,)):
+                    self.witness("old", (_KIND, kind))
                 verdict = _combine_pair(verdict, (_BREAKING, _COMPATIBLE))
             else:
                 self.change(element_path, f"element_type_{kind}_added", False)
+                with self._step((_ARRAY,)):
+                    self.witness("new", (_KIND, kind))
                 verdict = _combine_pair(verdict, (_COMPATIBLE, _BREAKING))
         return verdict
 
@@ -867,6 +967,194 @@ def _compat_report(
 ) -> dict:
     report = _CompatDiffer().diff(old_root, new_root)
     return {"from": old_revision, "to": new_revision, **report}
+
+
+# -- breaking-change witnesses ----------------------------------------------
+#
+# A witness for a breaking direction is one JSON object that the accepting
+# revision's ``check`` accepts (an empty report list) and the rejecting
+# revision's ``check`` rejects (the full, non-empty report list). The
+# differ records one recipe per breaking pair position while it walks; a
+# recipe is a tuple of tagged steps from the root object, and the builder
+# below turns each into a concrete, deterministic record straight off the
+# accepting revision's tree - it never parses change strings and never
+# invents fields, kinds or values the accepting schema has not observed.
+# Required sibling fields are filled along the way so the record is legal
+# as a whole, not just at the breaking position; approximated branches are
+# never forced (a recipe can only end on a branch the differ proved), so
+# an ``unknown`` direction simply yields no witness.
+
+# Canonical, deterministic leaf values. Booleans and numbers stay
+# distinct kinds (``True`` is never used where a number is required), and
+# ``None`` is only produced for the explicit null kind, never for a
+# missing field.
+_WITNESS_VALUES = {
+    "null": None,
+    "boolean": True,
+    "number": 1,
+    "string": "x",
+}
+
+
+def _check_against(root: dict, record: Any) -> list[str]:
+    """Run the exact ``check`` pipeline against an in-memory root."""
+    reports: list[str] = []
+    if not isinstance(record, dict):
+        return [f"$: type {_kind_of(record)} not in field types [object]"]
+    _check_object(root, record, "$", reports)
+    return reports
+
+
+def _first_kind(types: dict) -> str | None:
+    for kind in _KINDS:
+        if kind in types:
+            return kind
+    return None
+
+
+def _complete_value(types: dict, kind: str) -> Any:
+    """A deterministic value of ``kind`` legal under ``types``.
+
+    Scalars use canonical values; an object carries every required field
+    (each filled the same way); an array carries one complete element (or
+    stays empty when the schema tracked no element kinds - an empty array
+    passes check whatever the element type set).
+    """
+    if kind in _WITNESS_VALUES:
+        return _WITNESS_VALUES[kind]
+    node = types[kind]
+    if kind == "object":
+        return _complete_object(node)
+    return _complete_array(node)
+
+
+def _complete_object(node: dict) -> dict:
+    if _is_collapsed(node):
+        # A depth-capped object accepts anything, so the empty object is
+        # the smallest deterministic legal value.
+        return {}
+    record: dict[str, Any] = {}
+    for name in sorted(node["fields"]):
+        entry = node["fields"][name]
+        if entry["optional"]:
+            continue
+        kind = _first_kind(entry["types"])
+        if kind is not None:
+            record[name] = _complete_value(entry["types"], kind)
+    return record
+
+
+def _complete_array(node: dict) -> list:
+    kind = _first_kind(node["elements"])
+    if kind is None:
+        # No element kinds were ever observed (empty arrays folded here);
+        # check walks no elements, so the empty array passes.
+        return []
+    return [_complete_value(node["elements"], kind)]
+
+
+def _fill_required(node: dict, record: dict, skip: str | None) -> None:
+    """Add every still-missing required sibling field to ``record``."""
+    if _is_collapsed(node):
+        return
+    for name in sorted(node["fields"]):
+        if name == skip or name in record:
+            continue
+        entry = node["fields"][name]
+        if entry["optional"]:
+            continue
+        kind = _first_kind(entry["types"])
+        if kind is not None:
+            record[name] = _complete_value(entry["types"], kind)
+
+
+def _witness_value(types: dict, recipe: tuple, index: int) -> tuple[Any, int]:
+    """Build the value at one field/element position from ``recipe``.
+
+    ``types`` is the accepting side's type set at that position and
+    ``index`` points at the next step. Returns the value and the index of
+    the consumed terminal step.
+    """
+    tag, *payload = recipe[index]
+    if tag == _ARRAY:
+        # One nesting level: check walks every element against the one
+        # merged element set, so a single element witnesses the branch.
+        node = types["array"]
+        element, terminal = _witness_value(node["elements"], recipe, index + 1)
+        return [element], terminal
+    if tag == _FIELD:
+        node = types["object"]
+        return _witness_object_field(node, recipe, index)
+    # Terminal forced kind.
+    assert tag == _KIND
+    return _complete_value(types, payload[0]), index
+
+
+def _witness_object_field(
+    node: dict, recipe: tuple, index: int
+) -> tuple[Any, int]:
+    """Build an object value, forcing the recipe's field within it."""
+    tag, name = recipe[index]
+    assert tag == _FIELD
+    record: dict[str, Any] = {}
+    next_index = index + 1
+    next_step = recipe[next_index]
+    if next_step[0] == _MISSING:
+        # The witness omits this field, which the accepting tree may not
+        # even track (a field the other side removed or only it requires);
+        # only required siblings are filled.
+        _fill_required(node, record, name)
+        return record, next_index
+    entry = node["fields"][name]
+    value, terminal = _witness_value(entry["types"], recipe, next_index)
+    record[name] = value
+    _fill_required(node, record, name)
+    return record, terminal
+
+
+def _witness_record(root: dict, recipe: tuple) -> dict:
+    """Build the deterministic record one witness recipe describes."""
+    record, terminal = _witness_object_field(root, recipe, 0)
+    assert terminal == len(recipe) - 1
+    return record
+
+
+def _witness_report(
+    old_revision: int, new_revision: int, old_root: dict, new_root: dict
+) -> dict:
+    """The compat report plus verifiable breaking-direction witnesses."""
+    differ = _CompatDiffer()
+    report = differ.diff(old_root, new_root)
+    witnesses: dict[str, Any] = {"backward": None, "forward": None}
+    for direction, verdict, accepting, rejecting, side in (
+        ("backward", report["backward"], old_root, new_root, "old"),
+        ("forward", report["forward"], new_root, old_root, "new"),
+    ):
+        if verdict != _BREAKING:
+            # A compatible direction has no counterexample; an unknown
+            # direction cannot be settled, so one must never be forged.
+            continue
+        chosen: dict[str, Any] | None = None
+        for recipe_side, recipe in differ.recipes:
+            if recipe_side != side:
+                continue
+            record = _witness_record(accepting, recipe)
+            accepted_reports = _check_against(accepting, record)
+            rejected_reports = _check_against(rejecting, record)
+            if not accepted_reports and rejected_reports:
+                chosen = {"record": record, "reports": rejected_reports}
+                break
+        # Every breaking verdict comes from at least one exact breaking
+        # pair position, whose recipe must verify through check itself.
+        if chosen is None:  # pragma: no cover - construction invariant
+            raise SchemaConflict("could not construct a verifiable witness")
+        witnesses[direction] = chosen
+    return {
+        "from": old_revision,
+        "to": new_revision,
+        **report,
+        "witnesses": witnesses,
+    }
 
 
 def _normalize_overflow_names(node: Any) -> None:
@@ -1388,6 +1676,53 @@ class Lens:
                 "unknown_reasons": [],
             }
         return _compat_report(old_revision, new_revision, old_root, new_root)
+
+    def compat_witness(self, old_revision: int, new_revision: int) -> dict:
+        """Compat report with a verifiable counterexample per breaking side.
+
+        Behaves exactly like :meth:`compat` - same revisions, same fields,
+        content and ordering, same read-only guarantees - but adds one
+        ``witnesses`` object with ``backward`` and ``forward`` keys. Each
+        key is either ``null`` (the direction is ``compatible`` or
+        ``unknown``; a self-comparison has both ``null``) or an object
+        ``{"record": ..., "reports": [...]}``: ``record`` is one JSON
+        object the accepting revision's :meth:`check` accepts with an
+        empty report list, and ``reports`` is exactly the non-empty list
+        that revision's ``check`` returns for it. For a backward-breaking
+        direction ``record`` passes the old revision's check and is
+        rejected by the new one; forward breaking swaps the roles.
+
+        Witnesses are built from the accepting revision's own schema tree
+        and verified through ``check`` itself before they are reported, so
+        an ``unknown`` direction never gets a fabricated counterexample.
+        A missing, pruned/compacted-away or corrupt revision raises
+        ``SchemaConflict``; repeated analyses of the same pair return
+        identical records, key order, report lists and JSON bytes.
+        """
+        if (
+            isinstance(old_revision, bool)
+            or not isinstance(old_revision, int)
+            or old_revision < 1
+            or isinstance(new_revision, bool)
+            or not isinstance(new_revision, int)
+            or new_revision < 1
+        ):
+            raise SchemaConflict(
+                f"unknown schema revision: {old_revision!r}, {new_revision!r}"
+            )
+        old_root = self._read_revision(old_revision)
+        new_root = self._read_revision(new_revision)
+        if old_revision == new_revision:
+            return {
+                "from": old_revision,
+                "to": new_revision,
+                "backward": _COMPATIBLE,
+                "forward": _COMPATIBLE,
+                "changes": [],
+                "unknown_reasons": [],
+                "witnesses": {"backward": None, "forward": None},
+            }
+        return _witness_report(old_revision, new_revision, old_root, new_root)
 
     def compat_matrix(self, revisions: list[int] | tuple[int, ...] | None = None) -> dict:
         """Compare every ordered pair of committed revisions both ways.

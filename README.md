@@ -20,6 +20,7 @@ Python 3.11 or newer. Standard library only.
     python3 -m schema_lens --path ./lens compact [--keep <revisions>] [--background]
     python3 -m schema_lens --path ./lens status
     python3 -m schema_lens --path ./lens compat <old-revision> <new-revision>
+    python3 -m schema_lens --path ./lens witness <old-revision> <new-revision>
     python3 -m schema_lens --path ./lens matrix [--revisions 1,2,3]
 
 `check` and `show` accept `--version <revision>` to target one specific
@@ -37,6 +38,7 @@ committed revision; without it they use the snapshot loaded at open time.
 - `compact(*, keep=None, background=False) -> dict | None` merges the oldest history segment into one baseline version and returns `{"anchor": ..., "merged": [...]}` (or `None` when the history is already within the keep bound).
 - `compaction_status() -> dict` reports the committed baseline, the revisions merged into it, the live logical history and any background run in progress.
 - `compat(old_revision, new_revision) -> dict` reads two committed snapshots and reports how the evolution between them affects records legal under each side, without changing memory or any revision.
+- `compat_witness(old_revision, new_revision) -> dict` returns the same report as `compat` plus a `witnesses` object with a concrete, `check`-verified counterexample for each breaking direction (`null` for compatible/unknown, both `null` on a self-comparison), without changing memory or any revision.
 - `compat_matrix(revisions=None) -> dict` reads committed snapshots for every revision (or a strictly increasing selection) and reports both directional verdicts for every ordered pair, self-comparisons included, in one matrix.
 - `stats() -> dict` reports fields, optional fields, observed types and observation counts.
 - `SchemaConflict` exported exception.
@@ -281,6 +283,67 @@ A missing, pruned/compacted-away or corrupt revision raises
 fewer or more than two revision numbers is an argument error (`2`, no
 report). A completed analysis exits `0` even when a verdict is `breaking`
 or `unknown`.
+
+## Breaking-change witnesses
+
+`compat_witness(old, new)` (command: `witness <old-revision>
+<new-revision>`) runs the same analysis as `compat` - identical fields,
+content and ordering - and adds one `witnesses` object holding a
+`backward` and a `forward` key. Each key is `null`, or an object with a
+concrete counterexample:
+
+```json
+{
+  "from": 1,
+  "to": 2,
+  "backward": "breaking",
+  "forward": "compatible",
+  "changes": [
+    {"path": "$.b", "change": "field_removed", "breaking": true}
+  ],
+  "unknown_reasons": [],
+  "witnesses": {
+    "backward": {
+      "record": {"a": 1, "b": "x"},
+      "reports": ["$.b: unexpected field"]
+    },
+    "forward": null
+  }
+}
+```
+
+For a `backward` breaking direction, `record` is a JSON object the old
+revision's `check` accepts (its report list is empty) and `reports` is the
+exact, complete, non-empty list the new revision's `check` returns for it;
+for `forward` breaking the old and new roles are swapped. Either key is
+`null` when its direction is `compatible` or `unknown`, and a
+self-comparison has both `null`.
+
+Counterexamples are assembled from the accepting revision's own schema
+tree while the compatibility diff walks the two trees (required sibling
+fields filled, array branches reached through a single element), and each
+candidate is run through `check` itself before it is reported, so a
+witness can be re-checked directly against the lens. They cover added and
+removed fields, optionality changes, type-set changes, nested objects,
+array element objects and multi-level arrays; booleans are never used as
+numbers, a missing field is never represented as `null`, and an empty
+array is used where the tracked element set admits no element. Field
+names containing dots, backslashes or asterisks keep their real key in
+the record while the report paths stay quoted exactly as `check` prints
+them (`$["a.b"]`, `$["a\\b"]`, `$["*"]`). A merely approximate branch
+yields no witness, but when another branch elsewhere proves a direction
+breaking its witness is still supplied; only `unknown` directions have no
+counterexample.
+
+The analysis is read-only - it reads and validates the two snapshots,
+never infers, saves, rolls back, compacts or changes the open snapshot,
+pending batches or committed history - and the same pair always produces
+the same record, object key order, report list and command stdout bytes.
+Invalid revision arguments (non-integers, booleans or non-positive
+numbers) and missing, cleaned-up (pruned/compacted-away) or corrupt
+revisions raise `SchemaConflict`; the command exits `2` with empty stdout
+and the message on stderr, and exits `0` with only the report JSON on
+success, including `breaking` or `unknown` conclusions.
 
 ## Cross-version compatibility matrix
 
