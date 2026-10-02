@@ -42,6 +42,7 @@ committed revision; without it they use the snapshot loaded at open time.
 - `compat_matrix(revisions=None) -> dict` reads committed snapshots for every revision (or a strictly increasing selection) and reports both directional verdicts for every ordered pair, self-comparisons included, in one matrix.
 - `migrate(record, old_revision, new_revision, rules) -> dict` returns the `compat` report for the pair plus a `migration` object previewing an explicit field-level migration of one JSON object: check against the old revision, apply the rename/drop/default rules in order, check against the new revision. Read-only like `compat`.
 - `migrate_roundtrip(record, old_revision, new_revision, rules, rollback_rules) -> dict` returns the full `migrate` report plus a `rollback` object, rehearsing whether the rollback rules restore the original object: rollback rules run only after the forward preview reaches `done`, the recovered record is checked against the old revision, then compared with the original key by key ignoring key order. Read-only like `migrate`.
+- `migrate_stream(records, old_revision, new_revision, rules, rollback_rules=None) -> Iterator[dict]` previews the migration of a stream of records and yields one `{"index", "report", "error"}` result per input record (indexes from 1). `records` accepts any iterable, including a one-shot iterator; one record is consumed per pull with no prefetching and no per-record retention. Both rule groups, the revisions and the snapshots are settled before iteration starts, so invalid rules or a non-iterable input raise `ValueError` and invalid/missing/cleaned-up/corrupt revisions raise `SchemaConflict` without consuming any record. `rollback_rules=None` gives the full `migrate` report per record; an array (empty included, which enables the rollback) gives the full `migrate_roundtrip` report. A non-object record, a non-JSON value or a `ValueError` raised while rules run yields `report: null` with the message in `error` and the batch continues. Read-only like `migrate`.
 - `stats() -> dict` reports fields, optional fields, observed types and observation counts.
 - `SchemaConflict` exported exception.
 
@@ -513,6 +514,79 @@ perform, nothing is written and the input record, both rule lists, the
 open snapshot, uncommitted batches and every committed revision are
 exactly as they were; repeating the call returns identical content and
 order.
+
+## Streaming batch migration preview
+
+`migrate_stream(records, old_revision, new_revision, rules,
+rollback_rules=None)` (Python only) is the batch form of the two
+single-record previews. `records` is any iterable of JSON records - a
+list, a generator over a record stream, or any other one-shot iterator -
+and the call returns an iterator that yields one result per input record
+in order:
+
+```json
+{"index": 1, "report": {"...the full migrate or migrate_roundtrip report..."}, "error": null}
+{"index": 2, "report": null, "error": "record must be a JSON object"}
+```
+
+Indexes start at 1 and run contiguously. With `rollback_rules` omitted
+each `report` is exactly what `migrate` returns for that record; with an
+array given it is exactly what `migrate_roundtrip` returns, and an empty
+array is a valid group that still enables the rollback rehearsal. When a
+report is returned `error` is `null`; source and target check failures
+keep their existing `stage` (`"source"` / `"target"`) and the complete
+report lists, and a stopped forward preview still pairs with
+`"rollback": null` in roundtrip mode.
+
+A single record that is not a JSON object or that contains a non-JSON
+value, or a forward or rollback rule whose execution raises
+`ValueError` on that record (a string segment meeting a non-object, a
+`null` segment meeting a non-array, a rename onto an existing field),
+does not stop the batch: that result has `report: null` and the
+exception's message in `error`, and iteration continues with the next
+record.
+
+Validation happens in a fixed order before the result iterator is
+returned:
+
+1. both rule groups are validated structurally (`rollback_rules` must be
+   an array whenever it is given, the empty array included);
+2. the revision numbers are validated and both complete snapshots are
+   read and fully validated;
+3. only then is `records` turned into an iterator.
+
+An invalid rule group or a non-iterable `records` raises `ValueError`,
+and an invalid revision number or a missing, pruned/compacted-away,
+unreadable or corrupt revision raises `SchemaConflict`, before any
+record is consumed. An empty input goes through the same checks and then
+yields nothing.
+
+The iterator is genuinely streaming: each pull consumes exactly one
+input record and produces one result, records are never prefetched, and
+the iterator retains no state per processed record (just the input
+iterator and a running index), so its internal footprint does not grow
+with the number of records handled. If the input iterator itself raises
+anything other than the normal `StopIteration`, the result iterator
+terminates with that exception unchanged, and every result already
+yielded stays with the caller.
+
+The two snapshots are captured before iteration starts, so a commit,
+prune or compaction that lands after the call returns cannot change any
+answer of the batch (the compaction anchor keeps working, and the legacy
+single-file layout is still migrated in place on that first read). The
+validated rule lists are captured too, so mutating the caller's rules
+after the call does not affect the batch. Input records are never
+modified; every returned report and record is independent of the input,
+of the other results and of shared default values (editing one result
+cannot change a later one), and the same inputs always return the same
+content in the same order. Apart from the one legacy layout migration
+the first read may perform, nothing is written and the open snapshot,
+pending batches and committed history are untouched. Same-revision
+batches still run the rules, just like `migrate`; rename, drop, default
+and the array-wildcard (`null` segment) path semantics, the
+missing-versus-`null` distinction, approximate-branch checking and the
+rollback difference comparison are all exactly as for the single-record
+entries.
 
 ## Tests
 

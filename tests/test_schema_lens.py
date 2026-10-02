@@ -4464,6 +4464,612 @@ class MigrateRoundtripTests(unittest.TestCase):
         self.assertEqual(back[1]["value"], ["t"])
 
 
+class MigrateStreamTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.lens = Lens(self.dir.name)
+
+    def _publish(self, records, revision, **limits):
+        return _publish(self.dir.name, records, revision, **limits)
+
+    def _two_revisions(self):
+        self._publish([{"a": 1, "b": "x"}, {"a": 2, "b": "y"}], 1)
+        self._publish([{"a": 1, "c": "x"}, {"a": 2, "c": "y"}], 2)
+
+    def test_result_shape_and_migrate_report_without_rollback(self):
+        self._two_revisions()
+        rules = [{"op": "rename", "path": ["b"], "to": "c"}]
+        results = list(
+            self.lens.migrate_stream(
+                [{"a": 1, "b": "x"}], 1, 2, rules
+            )
+        )
+        self.assertEqual(len(results), 1)
+        self.assertEqual(set(results[0]), {"index", "report", "error"})
+        self.assertEqual(results[0]["index"], 1)
+        self.assertIsNone(results[0]["error"])
+        self.assertEqual(
+            results[0]["report"],
+            self.lens.migrate({"a": 1, "b": "x"}, 1, 2, rules),
+        )
+
+    def test_result_report_is_full_roundtrip_report_when_rules_given(self):
+        self._two_revisions()
+        rules = [{"op": "rename", "path": ["b"], "to": "c"}]
+        back = [{"op": "rename", "path": ["c"], "to": "b"}]
+        results = list(
+            self.lens.migrate_stream(
+                [{"a": 1, "b": "x"}], 1, 2, rules, back
+            )
+        )
+        self.assertEqual(
+            results[0]["report"],
+            self.lens.migrate_roundtrip(
+                {"a": 1, "b": "x"}, 1, 2, rules, back
+            ),
+        )
+
+    def test_empty_rollback_array_enables_the_rollback(self):
+        self._two_revisions()
+        results = list(
+            self.lens.migrate_stream(
+                [{"a": 1, "b": "x"}], 1, 2,
+                [{"op": "rename", "path": ["b"], "to": "c"}],
+                [],
+            )
+        )
+        report = results[0]["report"]
+        self.assertEqual(report["migration"]["stage"], "done")
+        self.assertIn("rollback", report)
+        # No rollback rules: the migrated record (``c``) is checked
+        # against the old revision (which requires ``b``), so the
+        # rollback reports target instead of being absent.
+        self.assertEqual(report["rollback"]["stage"], "target")
+        self.assertTrue(report["rollback"]["reports"])
+        self.assertEqual(report["rollback"]["differences"], [])
+
+    def test_indexes_run_contiguously_from_one(self):
+        self._two_revisions()
+        records = [
+            {"a": 1, "b": "x"},
+            [1, 2],
+            {"a": 2, "b": "y"},
+            "not-an-object",
+            {"a": 1, "b": "x"},
+        ]
+        results = list(self.lens.migrate_stream(iter(records), 1, 2, []))
+        self.assertEqual([result["index"] for result in results], [1, 2, 3, 4, 5])
+
+    def test_accepts_a_one_shot_generator(self):
+        self._two_revisions()
+
+        def generate():
+            yield {"a": 1, "b": "x"}
+            yield {"a": 2, "b": "y"}
+
+        results = list(self.lens.migrate_stream(generate(), 1, 2, []))
+        self.assertEqual([r["index"] for r in results], [1, 2])
+        self.assertTrue(all(r["error"] is None for r in results))
+
+    def test_non_object_and_non_json_records_become_errors_and_continue(self):
+        self._two_revisions()
+        records = [
+            {"a": 1, "b": "x"},
+            [1],
+            "x",
+            1,
+            None,
+            {"a": {1, 2}},
+            {"a": float("nan")},
+            {"a": 2, "b": "y"},
+        ]
+        results = list(self.lens.migrate_stream(records, 1, 2,
+                                                [{"op": "rename", "path": ["b"], "to": "c"}]))
+        self.assertEqual(len(results), 8)
+        self.assertIsNone(results[0]["error"])
+        self.assertIsNotNone(results[0]["report"])
+        for position in (1, 2, 3, 4, 5, 6):
+            with self.subTest(position=position):
+                self.assertIsNone(results[position]["report"])
+                self.assertIsInstance(results[position]["error"], str)
+                self.assertTrue(results[position]["error"])
+        # The batch kept going: the final valid record still reports.
+        self.assertIsNone(results[7]["error"])
+        self.assertEqual(
+            results[7]["report"]["migration"]["stage"], "done"
+        )
+
+    def test_source_and_target_failures_keep_stage_and_full_reports(self):
+        self._publish([{"a": 1}, {"a": 2}], 1)
+        self._publish([{"a": 3}, {"a": 4}], 2)
+        bad_source = {"a": "bad", "extra": 1}
+        results = list(
+            self.lens.migrate_stream(
+                [bad_source], 1, 2, [{"op": "drop", "path": ["a"]}]
+            )
+        )
+        migration = results[0]["report"]["migration"]
+        self.assertEqual(migration["stage"], "source")
+        self.assertIsNone(migration["record"])
+        self.assertEqual(
+            migration["reports"], self.lens.check(bad_source, version=1)
+        )
+
+        self._publish([{"a": 1, "b": 2}], 3)
+        target_results = list(
+            self.lens.migrate_stream(
+                [{"a": 1, "b": 2}],
+                3, 3,
+                [{"op": "rename", "path": ["b"], "to": "c"}],
+            )
+        )
+        migration = target_results[0]["report"]["migration"]
+        self.assertEqual(migration["stage"], "target")
+        self.assertEqual(
+            migration["reports"],
+            self.lens.check({"a": 1, "c": 2}, version=3),
+        )
+
+    def test_stopped_forward_preview_pairs_with_null_rollback(self):
+        self._publish([{"a": 1}, {"a": 2}], 1)
+        self._publish([{"a": 3}, {"a": 4}], 2)
+        results = list(
+            self.lens.migrate_stream(
+                [{"a": "bad"}], 1, 2, [], []
+            )
+        )
+        self.assertEqual(
+            results[0]["report"]["migration"]["stage"], "source"
+        )
+        self.assertIsNone(results[0]["report"]["rollback"])
+
+    def test_forward_rule_value_error_becomes_per_record_error(self):
+        # A string segment meeting a non-object mid-path.
+        self._publish([{"a": 1}, {"a": {"b": 2}}], 1)
+        self._publish([{"a": 1}, {"a": {"b": 2}}, {"a": {}}], 2)
+        records = [
+            {"a": 1},
+            {"a": {"b": 2}},
+        ]
+        rules = [{"op": "drop", "path": ["a", "b"]}]
+        results = list(self.lens.migrate_stream(records, 1, 2, rules))
+        self.assertIsNone(results[0]["report"])
+        self.assertEqual(
+            results[0]["error"], "string path segment requires an object"
+        )
+        # The second record drops ``b``; revision 2 also folded ``{}``,
+        # so the now-missing optional inner field passes the target.
+        self.assertIsNone(results[1]["error"])
+        self.assertEqual(results[1]["report"]["migration"]["stage"], "done")
+        self.assertEqual(
+            results[1]["report"]["migration"]["record"], {"a": {}}
+        )
+
+    def test_rollback_rule_value_error_becomes_per_record_error(self):
+        # Forward is a no-op self migration; the rollback null segment
+        # meets the non-array ``a``.
+        self._publish([{"a": [1]}, {"a": {"b": 2}}], 1)
+        results = list(
+            self.lens.migrate_stream(
+                [{"a": {"b": 2}}],
+                1, 1, [],
+                [{"op": "drop", "path": ["a", None, "b"]}],
+            )
+        )
+        self.assertIsNone(results[0]["report"])
+        self.assertEqual(
+            results[0]["error"], "null path segment requires an array"
+        )
+
+    def test_rename_conflict_in_stream_becomes_per_record_error(self):
+        # Revision 1 accepts both ``b`` and ``c`` (each optional): the
+        # first record carries both and hits the rename conflict, while a
+        # later record missing ``b`` simply skips the rename and passes.
+        self._publish([{"a": 1, "b": 2, "c": 3}, {"a": 2}], 1)
+        results = list(
+            self.lens.migrate_stream(
+                [{"a": 1, "b": 2, "c": 3}, {"a": 1}],
+                1, 1,
+                [{"op": "rename", "path": ["b"], "to": "c"}],
+            )
+        )
+        self.assertEqual(
+            results[0]["error"], "rename target 'c' already exists"
+        )
+        self.assertIsNone(results[0]["report"])
+        # The second record skips the missing source and succeeds.
+        self.assertIsNone(results[1]["error"])
+        self.assertEqual(
+            results[1]["report"]["migration"]["record"], {"a": 1}
+        )
+
+    def test_empty_input_runs_every_check_and_yields_nothing(self):
+        self._two_revisions()
+
+        class EmptyIterable:
+            def __init__(self):
+                self.iterator_obtained = []
+
+            def __iter__(self):
+                self.iterator_obtained.append(True)
+                return iter([])
+
+        records = EmptyIterable()
+        results = self.lens.migrate_stream(records, 1, 2, [], [])
+        # The iterable was turned into an iterator during the call...
+        self.assertEqual(records.iterator_obtained, [True])
+        # ...but it yields nothing.
+        self.assertEqual(list(results), [])
+
+    def test_empty_input_still_validates_rules(self):
+        self._two_revisions()
+        with self.assertRaises(ValueError):
+            list(self.lens.migrate_stream([], 1, 2, [{"op": "move"}]))
+        with self.assertRaises(ValueError):
+            list(self.lens.migrate_stream([], 1, 2, [], [{"op": "drop"}]))
+
+    def test_empty_input_still_validates_revisions(self):
+        self._two_revisions()
+        for old, new in ((0, 2), (True, 2), ("1", 2), (1, 9)):
+            with self.subTest(old=old, new=new):
+                with self.assertRaises(SchemaConflict):
+                    list(self.lens.migrate_stream([], old, new, []))
+
+    def test_rules_validated_before_records_are_consumed(self):
+        self._two_revisions()
+
+        def records():
+            raise AssertionError("records must not be consumed")
+            yield  # pragma: no cover
+
+        with self.assertRaises(ValueError):
+            self.lens.migrate_stream(records(), 1, 2, [{"op": "move"}])
+        with self.assertRaises(ValueError):
+            self.lens.migrate_stream(
+                records(), 1, 2, [], [{"op": "move"}]
+            )
+
+    def test_revisions_validated_before_records_are_consumed(self):
+        def records():
+            raise AssertionError("records must not be consumed")
+            yield  # pragma: no cover
+
+        with self.assertRaises(SchemaConflict):
+            self.lens.migrate_stream(records(), 9, 10, [])
+
+    def test_non_iterable_records_raises_value_error(self):
+        self._two_revisions()
+        with self.assertRaises(ValueError):
+            self.lens.migrate_stream(42, 1, 2, [])
+
+    def test_non_list_rules_raise_value_error(self):
+        self._two_revisions()
+        with self.assertRaises(ValueError):
+            self.lens.migrate_stream([], 1, 2, {"op": "drop"})
+        with self.assertRaises(ValueError):
+            self.lens.migrate_stream([], 1, 2, [], "not-a-list")
+
+    def test_corrupt_revision_raises_conflict_without_consuming_records(self):
+        self._two_revisions()
+        revision_path(self.dir.name, 2).write_text("not json", encoding="utf-8")
+
+        def records():
+            raise AssertionError("records must not be consumed")
+            yield  # pragma: no cover
+
+        with self.assertRaises(SchemaConflict):
+            self.lens.migrate_stream(records(), 1, 2, [])
+
+    def test_compacted_away_revision_conflicts_but_anchor_streams(self):
+        lens = _build_history(self.dir.name, 5, compact_keep=2)
+        lens.compact()
+        self.assertEqual(lens.versions(), [3, 4, 5])
+        with self.assertRaises(SchemaConflict):
+            lens.migrate_stream([{"f0": 0}], 1, 4, [])
+        results = list(
+            lens.migrate_stream([{"f2": 2}], 3, 4, [])
+        )
+        self.assertEqual(results[0]["report"]["migration"]["stage"], "done")
+
+    def test_one_record_consumed_per_pull_without_prefetching(self):
+        self._two_revisions()
+        pulled = []
+
+        def records():
+            for record in (
+                {"a": 1, "b": "x"},
+                {"a": 2, "b": "y"},
+                {"a": 1, "b": "x"},
+            ):
+                pulled.append(record["a"])
+                yield record
+
+        results = self.lens.migrate_stream(records(), 1, 2, [])
+        self.assertEqual(pulled, [])
+        first = next(results)
+        self.assertEqual(pulled, [1])
+        self.assertEqual(first["index"], 1)
+        second = next(results)
+        self.assertEqual(pulled, [1, 2])
+        self.assertEqual(second["index"], 2)
+        third = next(results)
+        self.assertEqual(pulled, [1, 2, 1])
+        with self.assertRaises(StopIteration):
+            next(results)
+        self.assertEqual(pulled, [1, 2, 1])
+
+    def test_no_state_retained_per_processed_record(self):
+        import gc
+        import weakref
+
+        self._two_revisions()
+        graves = []
+
+        class TrackedRecord(dict):
+            pass
+
+        def records():
+            for value in (1, 2, 3):
+                record = TrackedRecord(a=value, b=f"x{value}")
+                graves.append(weakref.ref(record))
+                yield record
+
+        rules = [{"op": "rename", "path": ["b"], "to": "c"}]
+        results = list(self.lens.migrate_stream(records(), 1, 2, rules))
+        gc.collect()
+        # The stream retains only independent deep copies: none of the
+        # original input records is kept alive by the machinery, while
+        # the three results remain fully usable.
+        self.assertTrue(all(ref() is None for ref in graves))
+        self.assertEqual(
+            [item["report"]["migration"]["record"] for item in results],
+            [{"a": 1, "c": "x1"}, {"a": 2, "c": "x2"}, {"a": 3, "c": "x3"}],
+        )
+
+    def test_input_iterator_exception_propagates_and_keeps_results(self):
+        self._two_revisions()
+        failure = RuntimeError("stream broke")
+
+        def records():
+            yield {"a": 1, "b": "x"}
+            yield {"a": 2, "b": "y"}
+            raise failure
+
+        results = self.lens.migrate_stream(records(), 1, 2, [])
+        first = next(results)
+        second = next(results)
+        with self.assertRaises(RuntimeError) as caught:
+            next(results)
+        self.assertIs(caught.exception, failure)
+        self.assertEqual(first["index"], 1)
+        self.assertEqual(second["index"], 2)
+        self.assertIsNone(first["error"])
+        self.assertIsNone(second["error"])
+
+    def test_snapshots_are_pinned_against_later_commits_and_compaction(self):
+        lens = _build_history(self.dir.name, 5, compact_keep=2)
+        records = [{"f0": 0, "shared": "s"}, {"shared": "s"}]
+        results = lens.migrate_stream(iter(records), 1, 4, [])
+        lens.compact()
+        # Revision 1 was merged into baseline 3 while the batch is open;
+        # every answer still comes from the captured pre-compaction
+        # snapshots in the original order.
+        streamed = list(results)
+        expected = lens  # lens still reads the post-compaction store
+        self.assertEqual(len(streamed), 2)
+        self.assertTrue(all(item["error"] is None for item in streamed))
+        self.assertEqual(
+            [item["report"]["from"] for item in streamed], [1, 1]
+        )
+        self.assertEqual(
+            [item["report"]["to"] for item in streamed], [4, 4]
+        )
+        # And reading revision 1 directly now conflicts, proving the
+        # batch really answered from its captured snapshot.
+        with self.assertRaises(SchemaConflict):
+            expected.schema(version=1)
+
+    def test_caller_mutating_rules_after_call_does_not_affect_batch(self):
+        self._two_revisions()
+        rules = [{"op": "rename", "path": ["b"], "to": "c"}]
+        back = [{"op": "rename", "path": ["c"], "to": "b"}]
+        results = self.lens.migrate_stream(
+            iter([{"a": 1, "b": "x"}, {"a": 2, "b": "y"}]),
+            1, 2, rules, back,
+        )
+        rules.append({"op": "drop", "path": ["a"]})
+        rules[0]["path"] = ["tampered"]
+        back.clear()
+        streamed = list(results)
+        self.assertEqual(
+            streamed[0]["report"],
+            self.lens.migrate_roundtrip(
+                {"a": 1, "b": "x"}, 1, 2,
+                [{"op": "rename", "path": ["b"], "to": "c"}],
+                [{"op": "rename", "path": ["c"], "to": "b"}],
+            ),
+        )
+        self.assertEqual(
+            streamed[1]["report"]["migration"]["record"],
+            {"a": 2, "c": "y"},
+        )
+
+    def test_same_inputs_return_same_content_and_order(self):
+        self._two_revisions()
+        records = [
+            {"a": 1, "b": "x"},
+            {"a": "bad"},
+            [1],
+            {"a": 2, "b": "y"},
+        ]
+        rules = [{"op": "rename", "path": ["b"], "to": "c"}]
+        back = [{"op": "rename", "path": ["c"], "to": "b"}]
+
+        def run():
+            return [
+                json.dumps(item, sort_keys=True)
+                for item in self.lens.migrate_stream(
+                    json.loads(json.dumps(records)), 1, 2, rules, back
+                )
+            ]
+
+        self.assertEqual(run(), run())
+
+    def test_input_records_are_never_modified(self):
+        self._publish([{"items": [{"x": 1}]}], 1)
+        self._publish([{"items": [{"y": 1}]}], 2)
+        records = [{"items": [{"x": 1}]}, {"items": [{"x": 2}]}]
+        rules = [
+            {"op": "rename", "path": ["items", None, "x"], "to": "y"}
+        ]
+        list(self.lens.migrate_stream(records, 1, 2, rules))
+        self.assertEqual(records, [{"items": [{"x": 1}]}, {"items": [{"x": 2}]}])
+
+    def test_results_are_independent_of_each_other_and_inputs(self):
+        self._publish(
+            [{"items": [{"x": 1, "tags": ["t"]}, {"x": 2}]}], 1
+        )
+        self._publish(
+            [{"items": [{"y": 1, "tags": ["t"]}, {"y": 2}]}], 2
+        )
+        rules = [{"op": "rename", "path": ["items", None, "x"], "to": "y"}]
+        back = [
+            {"op": "rename", "path": ["items", None, "y"], "to": "x"},
+            {"op": "default", "path": ["items", None, "tags"], "value": ["t"]},
+        ]
+        record = {"items": [{"x": 1}, {"x": 2}]}
+        results = self.lens.migrate_stream(
+            iter([record, {"items": [{"x": 9}]}]), 1, 2, rules, back
+        )
+        first = next(results)["report"]
+        recovered = first["rollback"]["record"]
+        recovered["items"][0]["tags"].append("u")
+        first["changes"].append("tampered")
+        second = next(results)["report"]
+        # Later results share nothing with the mutated first result...
+        self.assertEqual(
+            second["changes"],
+            self.lens.compat(1, 2)["changes"],
+        )
+        self.assertEqual(
+            second["rollback"]["record"]["items"][0]["tags"], ["t"]
+        )
+        # ...the input record is not aliased into any result...
+        self.assertEqual(record, {"items": [{"x": 1}, {"x": 2}]})
+        # ...and the shared default value is copied per use.
+        self.assertEqual(back[1]["value"], ["t"])
+
+    def test_same_revision_batch_still_applies_rules(self):
+        self._publish([{"a": 1, "b": 2}], 1)
+        results = list(
+            self.lens.migrate_stream(
+                [{"a": 1, "b": 2}],
+                1, 1,
+                [{"op": "rename", "path": ["b"], "to": "c"}],
+            )
+        )
+        report = results[0]["report"]
+        self.assertEqual(report["backward"], "compatible")
+        self.assertEqual(report["changes"], [])
+        self.assertEqual(report["migration"]["stage"], "target")
+        self.assertEqual(
+            report["migration"]["reports"],
+            self.lens.check({"a": 1, "c": 2}, version=1),
+        )
+
+    def test_wildcard_paths_default_null_distinction_and_differences(self):
+        self._publish([{"items": [{"x": 1}]}], 1)
+        self._publish([{"items": [{"y": 1}]}], 2)
+        # A present null must survive a default rule, and the rollback
+        # difference comparison keeps missing distinct from null.
+        results = list(
+            self.lens.migrate_stream(
+                [
+                    {"items": [{"x": 1}, {"x": 2}]},
+                ],
+                1, 2,
+                [{"op": "rename", "path": ["items", None, "x"], "to": "y"}],
+                [{"op": "rename", "path": ["items", None, "y"], "to": "x"}],
+            )
+        )
+        rollback = results[0]["report"]["rollback"]
+        self.assertEqual(rollback["stage"], "done")
+        self.assertEqual(rollback["differences"], [])
+
+        # A self-revision that folded both a present null and an absent
+        # field lets the rollback demonstrate missing versus null in
+        # both directions.
+        self._publish([{"b": None}, {}], 3)
+        present_null = list(
+            self.lens.migrate_stream(
+                [{"b": None}], 3, 3, [],
+                [{"op": "drop", "path": ["b"]}],
+            )
+        )
+        self.assertEqual(
+            present_null[0]["report"]["rollback"]["differences"], ["$.b"]
+        )
+        absent = list(
+            self.lens.migrate_stream(
+                [{}], 3, 3, [],
+                [{"op": "default", "path": ["b"], "value": None}],
+            )
+        )
+        self.assertEqual(
+            absent[0]["report"]["rollback"]["differences"], ["$.b"]
+        )
+
+    def test_open_snapshot_batches_and_history_are_untouched(self):
+        self._two_revisions()
+        self.lens.load()
+        self.lens.infer([{"pending": 1}])
+        snapshot = self.lens.schema()
+        versions_dir = Path(self.dir.name, VERSIONS_DIRNAME)
+        before = sorted(os.listdir(versions_dir))
+        list(
+            self.lens.migrate_stream(
+                [{"a": 1, "b": "x"}, "bad"], 1, 2,
+                [{"op": "rename", "path": ["b"], "to": "c"}],
+                [{"op": "rename", "path": ["c"], "to": "b"}],
+            )
+        )
+        self.assertEqual(self.lens.schema(), snapshot)
+        self.assertEqual(self.lens.versions(), [1, 2])
+        self.assertEqual(self.lens.check({"pending": 1}), [])
+        self.assertEqual(sorted(os.listdir(versions_dir)), before)
+
+    def test_legacy_single_file_migrates_on_first_stream_read(self):
+        from schema_lens.core import _checksum
+
+        folder = Lens(tempfile.mkdtemp())
+        folder.infer([{"a": 1, "b": "x"}, {"a": 2}])
+        root = folder.schema()
+        legacy = Path(self.dir.name, SCHEMA_FILENAME)
+        legacy.write_text(
+            json.dumps(
+                {"version": 2, "checksum": _checksum(root), "root": root},
+                indent=2, sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        lens = Lens(self.dir.name)
+        results = lens.migrate_stream([{"a": 1, "b": "x"}], 1, 1, [])
+        # Just obtaining the iterator performed the first read and hence
+        # the one legacy migration.
+        self.assertFalse(legacy.exists())
+        self.assertEqual(lens.versions(), [1])
+        versions_dir = Path(self.dir.name, VERSIONS_DIRNAME)
+        before = sorted(os.listdir(versions_dir))
+        streamed = list(results)
+        self.assertEqual(streamed[0]["report"]["migration"]["stage"], "done")
+        # Iterating writes nothing further: the revisions directory is
+        # byte-for-byte unchanged apart from no new entries.
+        self.assertEqual(sorted(os.listdir(versions_dir)), before)
+        self.assertFalse(legacy.exists())
+
+
 if __name__ == "__main__":
     unittest.main()
 

@@ -137,6 +137,34 @@ forward preview stops at ``"source"`` or ``"target"`` the ``rollback``
 object is ``null``. Both rule groups are fully validated together with
 the record before either revision is read, so an invalid rollback rule
 is reported even when the forward check fails.
+
+``migrate_stream(records, old_revision, new_revision, rules,
+rollback_rules=None)`` is the streaming batch form of those previews: it
+accepts any iterable of JSON records (a one-shot iterator included) and
+returns an iterator of per-record results, each just ``index`` (numbered
+contiguously from 1), ``report`` and ``error``. Both rule groups are
+validated first, then the revision numbers and both complete snapshots
+are read, and only then is the records iterator obtained - so an invalid
+rule or a non-iterable ``records`` raises ``ValueError`` and an invalid,
+missing, cleaned-up, unreadable or corrupt revision raises
+``SchemaConflict`` before any record is consumed, an empty input
+included (which then yields nothing). With ``rollback_rules`` omitted
+each ``report`` is the complete ``migrate`` report; with an array given
+(an empty array still enables the rollback) it is the complete
+``migrate_roundtrip`` report, with ``error`` ``null``. A record that is
+not an object or carries a non-JSON value, or a forward or rollback
+rule execution raising ``ValueError`` for that record, yields a ``null``
+``report`` with the exception message and does not stop the batch;
+source and target check failures keep their stage and full report
+lists. The returned iterator consumes exactly one record per pull
+without prefetching and holds no state per processed record; a
+non-``StopIteration`` exception from the input iterator terminates it
+as-is while results already yielded stay with the caller. The snapshots
+are captured before iteration starts, so later commits, cleanup or
+compaction cannot change the batch, and later caller mutation of the
+rules cannot either; input records are never modified, every returned
+value is independent of the inputs, the other results and shared
+defaults, and the same inputs always return the same content and order.
 """
 
 from __future__ import annotations
@@ -1425,6 +1453,78 @@ def _structural_diff_paths(original: dict, recovered: dict) -> list[str]:
     return sorted(set(_structural_differences(original, recovered, "$")))
 
 
+# -- streaming batch migration preview --------------------------------------
+#
+# ``migrate_stream`` is the batch form of the single-record previews. Both
+# rule groups, the two revisions and the records iterable are settled before
+# the result iterator is handed back, but no record is consumed before then:
+# each ``next`` pulls exactly one record and produces one result, and the
+# iterator retains nothing per processed record beyond a running index. A
+# record that is not a JSON object or carries a non-JSON value, or a forward
+# or rollback rule execution raising ``ValueError``, yields a ``null``
+# report with the exception message and processing continues with the next
+# record; any other exception from the input iterator terminates it as-is.
+
+
+def _build_compat_template(
+    old_revision: int, new_revision: int, old_root: dict, new_root: dict
+) -> dict:
+    """The per-record report skeleton shared by one stream batch.
+
+    Every record in a batch migrates between the same two pinned snapshots,
+    so the compat section is computed once and deep-copied per record; each
+    returned report is therefore independent of the others.
+    """
+    if old_revision == new_revision:
+        return {
+            "from": old_revision,
+            "to": new_revision,
+            "backward": _COMPATIBLE,
+            "forward": _COMPATIBLE,
+            "changes": [],
+            "unknown_reasons": [],
+        }
+    return _compat_report(old_revision, new_revision, old_root, new_root)
+
+
+def _forward_migration(
+    template: dict,
+    record: dict,
+    old_root: dict,
+    new_root: dict,
+    parsed_rules: list[dict],
+) -> tuple[dict, dict | None]:
+    """Run the source check, rules and target check on a record copy.
+
+    This is exactly the forward preview ``migrate`` performs, built on a
+    deep copy of the batch's compat template so the caller's snapshot stays
+    untouched. Returns the complete report and the migrated working record
+    (``None`` unless the stage is ``"done"``).
+    """
+    report = copy.deepcopy(template)
+    migrated = copy.deepcopy(record)
+    source_reports = _check_against(old_root, migrated)
+    if source_reports:
+        report["migration"] = {
+            "stage": "source",
+            "record": None,
+            "reports": source_reports,
+        }
+        return report, None
+    for rule in parsed_rules:
+        _apply_migration_rule(migrated, rule)
+    target_reports = _check_against(new_root, migrated)
+    if target_reports:
+        report["migration"] = {
+            "stage": "target",
+            "record": None,
+            "reports": target_reports,
+        }
+        return report, None
+    report["migration"] = {"stage": "done", "record": migrated, "reports": []}
+    return report, migrated
+
+
 def _normalize_overflow_names(node: Any) -> None:
     """Mark pre-tracking overflow entries with explicit ``names: None``.
 
@@ -2112,37 +2212,12 @@ class Lens:
             if old_revision == new_revision
             else self._read_revision(new_revision)
         )
-        if old_revision == new_revision:
-            report: dict[str, Any] = {
-                "from": old_revision,
-                "to": new_revision,
-                "backward": _COMPATIBLE,
-                "forward": _COMPATIBLE,
-                "changes": [],
-                "unknown_reasons": [],
-            }
-        else:
-            report = _compat_report(old_revision, new_revision, old_root, new_root)
-        migrated = copy.deepcopy(record)
-        source_reports = _check_against(old_root, migrated)
-        if source_reports:
-            report["migration"] = {
-                "stage": "source",
-                "record": None,
-                "reports": source_reports,
-            }
-            return report, old_root, None
-        for rule in parsed_rules:
-            _apply_migration_rule(migrated, rule)
-        target_reports = _check_against(new_root, migrated)
-        if target_reports:
-            report["migration"] = {
-                "stage": "target",
-                "record": None,
-                "reports": target_reports,
-            }
-            return report, old_root, None
-        report["migration"] = {"stage": "done", "record": migrated, "reports": []}
+        template = _build_compat_template(
+            old_revision, new_revision, old_root, new_root
+        )
+        report, migrated = _forward_migration(
+            template, record, old_root, new_root, parsed_rules
+        )
         return report, old_root, migrated
 
     def migrate(
@@ -2289,6 +2364,152 @@ class Lens:
             "differences": differences,
         }
         return report
+
+    def migrate_stream(
+        self,
+        records: Iterable[Any],
+        old_revision: int,
+        new_revision: int,
+        rules: list,
+        rollback_rules: list | None = None,
+    ) -> Iterator[dict]:
+        """Preview the migration of a stream of records, one result each.
+
+        The batch form of :meth:`migrate` (``rollback_rules=None``) and
+        :meth:`migrate_roundtrip` (``rollback_rules`` given, including an
+        empty array, which enables the rollback). Everything that can fail
+        before iteration starts is settled eagerly, in this order: both
+        rule groups are validated first, then the revision numbers and the
+        two snapshots are read and fully validated, and only then is
+        ``records`` turned into an iterator - so an invalid rule raises
+        ``ValueError`` and an invalid, missing, pruned/compacted-away,
+        unreadable or corrupt revision raises ``SchemaConflict`` without a
+        single record being consumed, even for an empty iterable. Rules
+        that are not arrays (and ``records`` that is not iterable) raise
+        ``ValueError``.
+
+        The returned iterator pulls one record per ``next`` - never
+        prefetching - and yields, for each input record in order, one
+        object ``{"index": n, "report": ..., "error": ...}`` with indexes
+        starting at 1 and running contiguously. ``report`` is the complete
+        :meth:`migrate` report (or the complete :meth:`migrate_roundtrip`
+        report when rollback rules were given) with ``error`` ``null``. A
+        record that is not a JSON object or carries a non-JSON value, or a
+        forward or rollback rule whose execution raises ``ValueError`` on
+        that record, yields ``report: null`` with the exception message in
+        ``error`` and iteration continues with the next record. Any other
+        exception raised by the input iterator (anything but the normal
+        ``StopIteration``) terminates the iterator unchanged, keeping the
+        results already produced.
+
+        The snapshots are captured before iteration begins, so commits,
+        pruning and compaction after the call returns never change the
+        batch's answers; the validated rule lists are copied, so later
+        mutation of the caller's rules cannot affect the batch. Input
+        records are never modified, returned reports and records are
+        independent of the inputs, of each other and of shared default
+        values, and the same inputs always produce the same content in the
+        same order. Apart from the legacy single-file migration the first
+        read may perform, nothing is written and the open snapshot,
+        pending batches and committed history are untouched.
+        """
+        # 1) Both rule groups first, so an invalid rollback rule is
+        # reported before any revision is touched - exactly like the
+        # single-record roundtrip - even when no rollback is requested an
+        # empty list is still a valid group (it enables the rollback).
+        parsed_rules = _parse_migration_rules(rules)
+        with_rollback = rollback_rules is not None
+        parsed_rollback_rules = (
+            _parse_migration_rules(rollback_rules, label="rollback rule")
+            if with_rollback
+            else []
+        )
+        # 2) Revision numbers and the complete snapshots next. Reading the
+        # revisions also performs the one-time legacy single-file
+        # migration, so every pre-iteration failure is settled here.
+        self._validate_revision_pair(old_revision, new_revision)
+        old_root = self._read_revision(old_revision)
+        new_root = (
+            old_root
+            if old_revision == new_revision
+            else self._read_revision(new_revision)
+        )
+        template = _build_compat_template(
+            old_revision, new_revision, old_root, new_root
+        )
+        # 3) Only now is the input touched: ``records`` must be iterable,
+        # and a one-shot iterator is consumed in place without buffering.
+        try:
+            iterator = iter(records)
+        except TypeError as exc:
+            raise ValueError("records must be an iterable of JSON objects") from exc
+        return self._migrate_stream_iter(
+            iterator,
+            old_root,
+            new_root,
+            copy.deepcopy(template),
+            copy.deepcopy(parsed_rules),
+            copy.deepcopy(parsed_rollback_rules),
+            with_rollback,
+        )
+
+    def _migrate_stream_iter(
+        self,
+        iterator: Iterator[Any],
+        old_root: dict,
+        new_root: dict,
+        template: dict,
+        parsed_rules: list[dict],
+        parsed_rollback_rules: list[dict],
+        with_rollback: bool,
+    ) -> Iterator[dict]:
+        # State is just the iterator and the running index: no processed
+        # record or result is retained, so memory does not grow with the
+        # number of records handled.
+        index = 0
+        while True:
+            try:
+                record = next(iterator)
+            except StopIteration:
+                return
+            index += 1
+            try:
+                if not isinstance(record, dict):
+                    raise ValueError("record must be a JSON object")
+                _require_json_value(record, "record")
+                report, migrated = _forward_migration(
+                    template, record, old_root, new_root, parsed_rules
+                )
+                if with_rollback:
+                    if report["migration"]["stage"] != "done":
+                        report["rollback"] = None
+                    else:
+                        recovered = copy.deepcopy(migrated)
+                        for rule in parsed_rollback_rules:
+                            _apply_migration_rule(recovered, rule)
+                        reports = _check_against(old_root, recovered)
+                        if reports:
+                            report["rollback"] = {
+                                "stage": "target",
+                                "record": None,
+                                "reports": reports,
+                                "differences": [],
+                            }
+                        else:
+                            differences = _structural_diff_paths(record, recovered)
+                            report["rollback"] = {
+                                "stage": "different" if differences else "done",
+                                "record": recovered,
+                                "reports": [],
+                                "differences": differences,
+                            }
+            except ValueError as exc:
+                # A bad record, a non-JSON value or a structural rule
+                # error for this record only: report the message and keep
+                # going with the next record.
+                yield {"index": index, "report": None, "error": str(exc)}
+                continue
+            yield {"index": index, "report": report, "error": None}
 
     def stats(self) -> dict:
         """Report fields, optional fields, observed types and counts.
