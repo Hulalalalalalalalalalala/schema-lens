@@ -3726,6 +3726,314 @@ class WitnessCliTests(unittest.TestCase):
                       ("compatible", "breaking", "unknown"))
 
 
+class MigrateTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.lens = Lens(self.dir.name)
+
+    def _publish(self, records, revision, **limits):
+        return _publish(self.dir.name, records, revision, **limits)
+
+    def test_report_shape_is_compat_plus_migration(self):
+        self._publish([{"a": 1}], 1)
+        self._publish([{"a": 2}], 2)
+        report = self.lens.migrate({"a": 1}, 1, 2, [])
+        self.assertEqual(
+            set(report),
+            {"from", "to", "backward", "forward", "changes",
+             "unknown_reasons", "migration"},
+        )
+        self.assertEqual(
+            {key: report[key] for key in
+             ("from", "to", "backward", "forward", "changes",
+              "unknown_reasons")},
+            self.lens.compat(1, 2),
+        )
+        self.assertEqual(
+            report["migration"],
+            {"stage": "done", "record": {"a": 1}, "reports": []},
+        )
+
+    def test_rename_between_revisions(self):
+        self._publish([{"a": 1, "b": "x"}, {"a": 2, "b": "y"}], 1)
+        self._publish([{"a": 1, "c": "x"}, {"a": 2, "c": "y"}], 2)
+        report = self.lens.migrate(
+            {"a": 1, "b": "x"}, 1, 2,
+            [{"op": "rename", "path": ["b"], "to": "c"}],
+        )
+        self.assertEqual(
+            report["migration"],
+            {"stage": "done", "record": {"a": 1, "c": "x"}, "reports": []},
+        )
+
+    def test_empty_rules_validates_without_transforming(self):
+        self._publish([{"a": 1}, {"a": 2}], 1)
+        report = self.lens.migrate({"a": 1}, 1, 1, [])
+        self.assertEqual(
+            report["migration"],
+            {"stage": "done", "record": {"a": 1}, "reports": []},
+        )
+
+    def test_source_failure_reports_source_stage(self):
+        self._publish([{"a": 1}, {"a": 2}], 1)
+        self._publish([{"a": 3}, {"a": 4}], 2)
+        record = {"a": "bad", "extra": 1}
+        report = self.lens.migrate(record, 1, 2, [{"op": "drop", "path": ["a"]}])
+        self.assertEqual(report["migration"]["stage"], "source")
+        self.assertIsNone(report["migration"]["record"])
+        self.assertEqual(
+            report["migration"]["reports"],
+            self.lens.check(record, version=1),
+        )
+        self.assertTrue(report["migration"]["reports"])
+
+    def test_target_failure_reports_target_stage(self):
+        self._publish([{"a": 1, "b": "x"}, {"a": 2, "b": "y"}], 1)
+        self._publish([{"a": 1, "b": "x"}, {"a": 2, "b": "y"}], 2)
+        record = {"a": 1, "b": "x"}
+        rules = [{"op": "drop", "path": ["a"]}]
+        report = self.lens.migrate(record, 1, 2, rules)
+        self.assertEqual(report["migration"]["stage"], "target")
+        self.assertIsNone(report["migration"]["record"])
+        self.assertEqual(
+            report["migration"]["reports"],
+            self.lens.check({"b": "x"}, version=2),
+        )
+        self.assertTrue(report["migration"]["reports"])
+
+    def test_rules_apply_in_order(self):
+        self._publish([{"a": 1, "b": 2}], 1)
+        self._publish([{"a": 1, "c": 2, "d": 0}], 2)
+        report = self.lens.migrate(
+            {"a": 1, "b": 2}, 1, 2,
+            [
+                {"op": "rename", "path": ["b"], "to": "c"},
+                {"op": "default", "path": ["d"], "value": 0},
+            ],
+        )
+        self.assertEqual(
+            report["migration"]["record"], {"a": 1, "c": 2, "d": 0}
+        )
+
+    def test_rename_keeps_field_position(self):
+        self._publish([{"a": 1, "b": 2, "c": 3}], 1)
+        self._publish([{"a": 1, "B": 2, "c": 3}], 2)
+        report = self.lens.migrate(
+            {"a": 1, "b": 2, "c": 3}, 1, 2,
+            [{"op": "rename", "path": ["b"], "to": "B"}],
+        )
+        self.assertEqual(
+            list(report["migration"]["record"]), ["a", "B", "c"]
+        )
+
+    def test_rename_missing_source_skips(self):
+        self._publish([{"a": 1, "b": 2}, {"a": 3}], 1)
+        self._publish([{"a": 1, "c": 2}, {"a": 3}], 2)
+        report = self.lens.migrate(
+            {"a": 1}, 1, 2, [{"op": "rename", "path": ["b"], "to": "c"}]
+        )
+        self.assertEqual(report["migration"]["record"], {"a": 1})
+
+    def test_rename_onto_existing_field_raises(self):
+        self._publish([{"a": 1, "b": 2}], 1)
+        with self.assertRaises(ValueError):
+            self.lens.migrate(
+                {"a": 1, "b": 2}, 1, 1,
+                [{"op": "rename", "path": ["a"], "to": "b"}],
+            )
+
+    def test_rename_to_same_name_raises(self):
+        self._publish([{"a": 1}], 1)
+        with self.assertRaises(ValueError):
+            self.lens.migrate(
+                {"a": 1}, 1, 1, [{"op": "rename", "path": ["a"], "to": "a"}]
+            )
+
+    def test_drop_missing_field_skips(self):
+        self._publish([{"a": 1}], 1)
+        report = self.lens.migrate({"a": 1}, 1, 1, [{"op": "drop", "path": ["b"]}])
+        self.assertEqual(report["migration"]["record"], {"a": 1})
+
+    def test_default_fills_missing_but_keeps_null(self):
+        self._publish([{"a": 1, "b": "x"}, {"a": 2, "b": None}], 1)
+        report = self.lens.migrate(
+            {"a": 1, "b": None}, 1, 1,
+            [{"op": "default", "path": ["b"], "value": "z"}],
+        )
+        self.assertEqual(report["migration"]["record"], {"a": 1, "b": None})
+
+    def test_null_segment_walks_every_array_element(self):
+        self._publish([{"items": [{"x": 1}, {"x": 2}]}], 1)
+        self._publish([{"items": [{"y": 1}, {"y": 2}]}], 2)
+        report = self.lens.migrate(
+            {"items": [{"x": 1}, {"x": 2}]}, 1, 2,
+            [{"op": "rename", "path": ["items", None, "x"], "to": "y"}],
+        )
+        self.assertEqual(
+            report["migration"]["record"], {"items": [{"y": 1}, {"y": 2}]}
+        )
+
+    def test_dotted_name_is_one_literal_field(self):
+        self._publish([{"items": [{"a.b": 1}]}], 1)
+        self._publish([{"items": [{"c": 1}]}], 2)
+        report = self.lens.migrate(
+            {"items": [{"a.b": 1}]}, 1, 2,
+            [{"op": "rename", "path": ["items", None, "a.b"], "to": "c"}],
+        )
+        self.assertEqual(report["migration"]["record"], {"items": [{"c": 1}]})
+
+    def test_missing_parent_skips_without_creating(self):
+        self._publish([{"a": 1}], 1)
+        report = self.lens.migrate(
+            {"a": 1}, 1, 1,
+            [
+                {"op": "default", "path": ["gone", "b"], "value": 1},
+                {"op": "drop", "path": ["gone", "b"]},
+            ],
+        )
+        self.assertEqual(report["migration"]["record"], {"a": 1})
+
+    def test_string_segment_on_non_object_raises(self):
+        self._publish([{"a": 1}, {"a": {"b": 2}}], 1)
+        with self.assertRaises(ValueError):
+            self.lens.migrate({"a": 1}, 1, 1, [{"op": "drop", "path": ["a", "b"]}])
+
+    def test_null_segment_on_non_array_raises(self):
+        self._publish([{"a": [1]}, {"a": {"b": 2}}], 1)
+        with self.assertRaises(ValueError):
+            self.lens.migrate(
+                {"a": {"b": 2}}, 1, 1, [{"op": "drop", "path": ["a", None, "b"]}]
+            )
+
+    def test_null_segment_over_non_object_element_raises(self):
+        self._publish([{"a": [1, 2]}], 1)
+        with self.assertRaises(ValueError):
+            self.lens.migrate({"a": [1]}, 1, 1, [{"op": "drop", "path": ["a", None, "b"]}])
+
+    def test_empty_array_selects_nothing(self):
+        self._publish([{"a": [{"b": 1}]}], 1)
+        report = self.lens.migrate(
+            {"a": []}, 1, 1, [{"op": "drop", "path": ["a", None, "b"]}]
+        )
+        self.assertEqual(report["migration"]["record"], {"a": []})
+
+    def test_invalid_rule_structures_raise(self):
+        self._publish([{"a": 1}], 1)
+        bad_rules = [
+            "not-a-rule",
+            {"op": "move", "path": ["a"]},
+            {"op": "drop"},
+            {"op": "drop", "path": "a"},
+            {"op": "drop", "path": []},
+            {"op": "drop", "path": [None]},
+            {"op": "drop", "path": [1]},
+            {"op": "drop", "path": ["a"], "to": "b"},
+            {"op": "rename", "path": ["a"]},
+            {"op": "rename", "path": ["a"], "to": 1},
+            {"op": "default", "path": ["a"]},
+            {"op": "default", "path": ["a"], "value": object()},
+        ]
+        for rules in bad_rules:
+            with self.subTest(rules=rules):
+                with self.assertRaises(ValueError):
+                    self.lens.migrate({"a": 1}, 1, 1, [rules])
+        with self.assertRaises(ValueError):
+            self.lens.migrate({"a": 1}, 1, 1, {"op": "drop"})
+
+    def test_non_object_record_and_non_json_values_raise(self):
+        self._publish([{"a": 1}], 1)
+        for record in ([1], "x", 1, None, {"a": {1, 2}}, {"a": float("nan")}):
+            with self.subTest(record=record):
+                with self.assertRaises(ValueError):
+                    self.lens.migrate(record, 1, 1, [])
+
+    def test_invalid_and_missing_revisions_raise_conflict(self):
+        self._publish([{"a": 1}], 1)
+        for old, new in ((0, 1), (1, -1), (True, 1), ("1", 1), (1, 2), (2, 1)):
+            with self.subTest(old=old, new=new):
+                with self.assertRaises(SchemaConflict):
+                    self.lens.migrate({"a": 1}, old, new, [])
+
+    def test_corrupt_revision_raises_conflict(self):
+        self._publish([{"a": 1}], 1)
+        self._publish([{"a": 2}], 2)
+        revision_path(self.dir.name, 2).write_text("not json", encoding="utf-8")
+        with self.assertRaises(SchemaConflict):
+            self.lens.migrate({"a": 1}, 1, 2, [])
+
+    def test_compacted_revision_raises_but_anchor_reads(self):
+        lens = _build_history(self.dir.name, 5, compact_keep=2)
+        lens.compact()
+        self.assertEqual(lens.versions(), [3, 4, 5])
+        report = lens.migrate({"f2": 2}, 3, 4, [])
+        self.assertEqual(report["migration"]["stage"], "done")
+        with self.assertRaises(SchemaConflict):
+            lens.migrate({}, 1, 4, [])
+
+    def test_same_revision_applies_rules_and_validates(self):
+        self._publish([{"a": 1, "b": 2}], 1)
+        report = self.lens.migrate(
+            {"a": 1, "b": 2}, 1, 1, [{"op": "rename", "path": ["b"], "to": "c"}]
+        )
+        self.assertEqual(report["backward"], "compatible")
+        self.assertEqual(report["forward"], "compatible")
+        self.assertEqual(report["changes"], [])
+        self.assertEqual(report["migration"]["stage"], "target")
+        self.assertEqual(
+            report["migration"]["reports"],
+            self.lens.check({"a": 1, "c": 2}, version=1),
+        )
+
+    def test_repeated_migration_is_stable(self):
+        self._publish([{"a": 1, "b": "x"}], 1)
+        self._publish([{"a": 1, "c": "x"}], 2)
+        rules = [{"op": "rename", "path": ["b"], "to": "c"}]
+        first = self.lens.migrate({"a": 1, "b": "x"}, 1, 2, rules)
+        for _ in range(3):
+            again = self.lens.migrate({"a": 1, "b": "x"}, 1, 2, rules)
+            self.assertEqual(
+                json.dumps(first), json.dumps(again)
+            )
+
+    def test_inputs_and_state_are_untouched(self):
+        self._publish([{"a": 1, "b": "x"}], 1)
+        self._publish([{"a": 1, "c": "x"}], 2)
+        self.lens.infer([{"pending": 1}])
+        snapshot = self.lens.schema()
+        record = {"a": 1, "b": "x"}
+        rules = [
+            {"op": "rename", "path": ["b"], "to": "c"},
+            {"op": "default", "path": ["d"], "value": ["e"]},
+        ]
+        self.lens.migrate(record, 1, 2, rules)
+        self.assertEqual(record, {"a": 1, "b": "x"})
+        self.assertEqual(
+            rules,
+            [
+                {"op": "rename", "path": ["b"], "to": "c"},
+                {"op": "default", "path": ["d"], "value": ["e"]},
+            ],
+        )
+        self.assertEqual(self.lens.schema(), snapshot)
+        self.assertEqual(self.lens.versions(), [1, 2])
+        self.assertEqual(self.lens.check({"pending": 1}), [])
+
+    def test_default_value_is_copied_per_element(self):
+        self._publish(
+            [{"items": [{"x": 1, "tags": ["t"]}, {"x": 2}]}], 1
+        )
+        rules = [{"op": "default", "path": ["items", None, "tags"], "value": ["t"]}]
+        report = self.lens.migrate({"items": [{"x": 1}, {"x": 2}]}, 1, 1, rules)
+        record = report["migration"]["record"]
+        self.assertEqual(
+            record, {"items": [{"x": 1, "tags": ["t"]}, {"x": 2, "tags": ["t"]}]}
+        )
+        record["items"][0]["tags"].append("u")
+        self.assertEqual(rules[0]["value"], ["t"])
+        self.assertEqual(record["items"][1]["tags"], ["t"])
+
+
 if __name__ == "__main__":
     unittest.main()
 

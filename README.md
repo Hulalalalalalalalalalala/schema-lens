@@ -40,6 +40,7 @@ committed revision; without it they use the snapshot loaded at open time.
 - `compat(old_revision, new_revision) -> dict` reads two committed snapshots and reports how the evolution between them affects records legal under each side, without changing memory or any revision.
 - `compat_witness(old_revision, new_revision) -> dict` returns the same report as `compat` plus a `witnesses` object with a concrete, `check`-verified counterexample for each breaking direction (`null` for compatible/unknown, both `null` on a self-comparison), without changing memory or any revision.
 - `compat_matrix(revisions=None) -> dict` reads committed snapshots for every revision (or a strictly increasing selection) and reports both directional verdicts for every ordered pair, self-comparisons included, in one matrix.
+- `migrate(record, old_revision, new_revision, rules) -> dict` returns the `compat` report for the pair plus a `migration` object previewing an explicit field-level migration of one JSON object: check against the old revision, apply the rename/drop/default rules in order, check against the new revision. Read-only like `compat`.
 - `stats() -> dict` reports fields, optional fields, observed types and observation counts.
 - `SchemaConflict` exported exception.
 
@@ -394,6 +395,62 @@ compacted away, or is corrupt raises `SchemaConflict`. The command exits
 `2` and prints no report in every one of those cases; on success it exits
 `0` with only the matrix JSON on stdout (errors go to stderr), and
 repeating the same inputs produces byte-identical content and ordering.
+
+## Field migration preview
+
+`migrate(record, old_revision, new_revision, rules)` (Python only)
+previews an explicit field-level migration of one JSON object between
+two committed revisions. It returns exactly the `compat` report for the
+pair plus one `migration` object:
+
+```json
+{
+  "from": 1, "to": 2,
+  "backward": "compatible", "forward": "breaking",
+  "changes": [{"path": "$.c", "change": "field_added", "breaking": false}],
+  "unknown_reasons": [],
+  "migration": {"stage": "done", "record": {"a": 1, "c": "x"}, "reports": []}
+}
+```
+
+The record is first checked against the old revision, then transformed
+by the rules in order (each rule applies to the result of the previous
+one; an empty rule array validates without transforming), then checked
+against the new revision - both checks judged exactly as `check` judges
+optional fields, type unions and approximate branches. When both pass,
+`stage` is `"done"`, `record` is the complete migrated record and
+`reports` is empty. When the source or target check fails, `stage` is
+`"source"` or `"target"`, `record` is `null` and `reports` is the full
+list that revision's `check` returns. Migrating from a revision to
+itself still applies the rules and runs both checks.
+
+`rules` is a JSON array of rule objects. Every rule has an `op` and a
+`path`; `rename` adds a string `to` naming the new sibling field,
+`default` adds a JSON `value` to fill in, and `drop` takes nothing
+else. No other keys are allowed. The path is a non-empty array whose
+string segments are literal field names (a name containing a dot names
+one field, never a descent) and whose `null` segments select every
+element of the array at that position; the last segment is always a
+string, so `["items", null, "a.b"]` names the field `a.b` inside every
+element of `items`. `rename` keeps the field's value under the new
+name, skipping objects where the source field is missing and raising
+`ValueError` where the target name already exists; `drop` removes the
+field, skipping it where missing; `default` fills only a genuinely
+missing field and never replaces a present `null`. A missing parent
+field skips the rule for that branch (parents are never created, and an
+empty array simply selects nothing), while a string segment meeting a
+non-object or a `null` segment meeting a non-array raises `ValueError`.
+
+The record must be a JSON object; a non-JSON value, a malformed rule
+(unknown op, missing or extra keys, an invalid path, a rename onto the
+same name) raises `ValueError`. Invalid revision numbers and missing,
+pruned/compacted-away or corrupt revisions raise `SchemaConflict`; a
+compaction anchor stays readable, and a legacy single-file lens
+directory is migrated in place on first read exactly as for the other
+entry points. Nothing else is written and nothing shared is mutated:
+the input record and rules, the open snapshot, uncommitted batches and
+every committed revision are exactly as they were, and the same input
+always returns the same content in the same order.
 
 ## Tests
 

@@ -103,6 +103,23 @@ the accepting revision's tree while the symmetric diff walks it and are
 verified through ``check`` itself, so an unknowable approximate branch
 never gets a fabricated witness; every record, key order and report list
 is stable for the same pair. Like ``compat`` it is read-only.
+
+``migrate(record, old_revision, new_revision, rules)`` previews an
+explicit field-level migration of one JSON object between two committed
+revisions. It returns the ``compat`` report for the pair plus a
+``migration`` object: the source record is checked against the old
+revision, the rules are applied in order (``rename`` keeps a field's
+value under a new sibling name, ``drop`` removes a field, ``default``
+fills a genuinely missing field), and the result is checked against the
+new revision. ``migration["stage"]`` is ``"done"`` with the full
+migrated record and no reports when both checks pass; a failing source
+or target check reports ``"source"`` or ``"target"`` with a ``null``
+record and exactly the report list that revision's ``check`` returns.
+Rule paths are arrays of literal field names with ``null`` selecting
+every element of an array. Like ``compat`` it only reads committed
+snapshots: the input record, the rules, the open snapshot, uncommitted
+batches and every committed revision are left untouched, and the same
+input always yields the same content and order.
 """
 
 from __future__ import annotations
@@ -112,6 +129,7 @@ import copy
 import hashlib
 import itertools
 import json
+import math
 import os
 import threading
 import time
@@ -1157,6 +1175,156 @@ def _witness_report(
     }
 
 
+# -- field migration preview -------------------------------------------------
+#
+# A migration rule is a small JSON object describing one field-level edit:
+# ``{"op": "rename", "path": [...], "to": name}`` moves a field's value to
+# a new sibling name, ``{"op": "drop", "path": [...]}`` removes a field,
+# and ``{"op": "default", "path": [...], "value": ...}`` fills a field that
+# is genuinely missing (a present ``null`` is a value and is kept). The
+# path is a non-empty array whose string segments are literal field names
+# (a name containing a dot names one field, never a descent) and whose
+# ``null`` segments select every element of the array at that position;
+# the last segment is always a string naming the field the op edits.
+# Rules apply in order, each to the result of the previous one. A parent
+# that is simply missing skips the rule for that branch - parents are
+# never created - while a string segment meeting a non-object or a null
+# segment meeting a non-array is a structural ``ValueError``, as is a
+# rename whose target field already exists.
+
+_MIGRATION_OPS = ("rename", "drop", "default")
+
+
+def _require_json_value(value: Any, what: str) -> None:
+    """Reject anything JSON cannot represent, recursing into containers."""
+    if value is None or isinstance(value, (str, bool, int)):
+        return
+    if isinstance(value, float):
+        if math.isfinite(value):
+            return
+    elif isinstance(value, list):
+        for item in value:
+            _require_json_value(item, what)
+        return
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                break
+            _require_json_value(item, what)
+        else:
+            return
+    raise ValueError(f"{what} must be a JSON value")
+
+
+def _parse_migration_rules(rules: Any) -> list[dict]:
+    """Validate the rule list structurally before anything is applied.
+
+    Every rule must be a JSON object carrying exactly the keys its op
+    needs - ``op`` and ``path`` for all three, ``to`` for rename,
+    ``value`` for default - with a non-empty path of string/null segments
+    ending in a string, a string rename target distinct from the source
+    field name, and a JSON default value. Anything else is a
+    ``ValueError`` raised before any revision is read or any rule runs.
+    """
+    if not isinstance(rules, list):
+        raise ValueError("migration rules must be a JSON array")
+    for index, rule in enumerate(rules):
+        if not isinstance(rule, dict):
+            raise ValueError(f"migration rule {index} must be a JSON object")
+        op = rule.get("op")
+        if op not in _MIGRATION_OPS:
+            raise ValueError(f"migration rule {index}: unknown op {op!r}")
+        path = rule.get("path")
+        if (
+            not isinstance(path, list)
+            or not path
+            or any(
+                segment is not None and not isinstance(segment, str)
+                for segment in path
+            )
+            or not isinstance(path[-1], str)
+        ):
+            raise ValueError(f"migration rule {index}: invalid path")
+        expected = {"op", "path"}
+        if op == "rename":
+            expected.add("to")
+        elif op == "default":
+            expected.add("value")
+        if set(rule) != expected:
+            raise ValueError(f"migration rule {index}: invalid keys for {op}")
+        if op == "rename":
+            if not isinstance(rule["to"], str):
+                raise ValueError(
+                    f"migration rule {index}: rename target must be a string"
+                )
+            if rule["to"] == path[-1]:
+                raise ValueError(
+                    f"migration rule {index}: rename target equals the "
+                    "source field"
+                )
+        elif op == "default":
+            _require_json_value(rule["value"], f"migration rule {index} value")
+    return rules
+
+
+def _migration_containers(record: dict, path: list) -> list:
+    """The containers the path's final segment applies to.
+
+    Navigates every segment but the last: a string segment descends into
+    the named field of an object (a missing field drops that branch
+    silently - parents are never created), a null segment spreads over
+    every element of an array (an empty array simply selects nothing).
+    A string segment meeting a non-object or a null segment meeting a
+    non-array is a structural ``ValueError``.
+    """
+    containers = [record]
+    for segment in path[:-1]:
+        following = []
+        for container in containers:
+            if segment is None:
+                if not isinstance(container, list):
+                    raise ValueError("null path segment requires an array")
+                following.extend(container)
+            else:
+                if not isinstance(container, dict):
+                    raise ValueError("string path segment requires an object")
+                if segment in container:
+                    following.append(container[segment])
+        if not following:
+            return []
+        containers = following
+    return containers
+
+
+def _apply_migration_rule(record: dict, rule: dict) -> None:
+    """Apply one already-validated rule to the working record in place."""
+    op = rule["op"]
+    last = rule["path"][-1]
+    for container in _migration_containers(record, rule["path"]):
+        if not isinstance(container, dict):
+            raise ValueError("string path segment requires an object")
+        if op == "rename":
+            if last not in container:
+                continue
+            to = rule["to"]
+            if to in container:
+                raise ValueError(f"rename target {to!r} already exists")
+            # Rebuild in place so the field keeps its position under the
+            # new name and the same input always yields the same order.
+            renamed = [
+                (to if key == last else key, value)
+                for key, value in container.items()
+            ]
+            container.clear()
+            container.update(renamed)
+        elif op == "drop":
+            container.pop(last, None)
+        # default fills only a genuinely missing field; a present null is
+        # a value and is never replaced.
+        elif last not in container:
+            container[last] = copy.deepcopy(rule["value"])
+
+
 def _normalize_overflow_names(node: Any) -> None:
     """Mark pre-tracking overflow entries with explicit ``names: None``.
 
@@ -1808,6 +1976,97 @@ class Lens:
                         )
                     )
         return {"revisions": list(selected), "pairs": pairs}
+
+    def migrate(
+        self,
+        record: Any,
+        old_revision: int,
+        new_revision: int,
+        rules: list,
+    ) -> dict:
+        """Preview an explicit field migration between two revisions.
+
+        Reads the two committed snapshots exactly like :meth:`compat`
+        (a missing, pruned/compacted-away or corrupt revision raises
+        ``SchemaConflict``; the compaction anchor stays readable) and
+        returns the pair's :meth:`compat` report plus one ``migration``
+        object::
+
+            {
+              "from": <old revision>, "to": <new revision>,
+              "backward": ..., "forward": ...,
+              "changes": [...], "unknown_reasons": [...],
+              "migration": {"stage": ..., "record": ..., "reports": [...]},
+            }
+
+        The record - which must be a JSON object, and ``rules`` a JSON
+        array of rename/drop/default rule objects, anything else raising
+        ``ValueError`` - is first checked against the old revision, then
+        transformed by the rules in order (an empty array validates
+        without transforming), then checked against the new revision,
+        both checks judged exactly as :meth:`check` judges optional
+        fields, type unions and approximate branches. When both pass,
+        ``stage`` is ``"done"``, ``record`` is the complete migrated
+        record and ``reports`` is empty; when the source or target check
+        fails, ``stage`` is ``"source"`` or ``"target"``, ``record`` is
+        ``None`` and ``reports`` is the full list that revision's
+        :meth:`check` returns. A self-migration (same revision twice)
+        still applies the rules and runs both checks.
+
+        Nothing is written and nothing shared is mutated: the input
+        record and rules, the open snapshot, uncommitted batches and
+        every committed revision are exactly as they were, and the same
+        input always returns the same content in the same order.
+        """
+        if (
+            isinstance(old_revision, bool)
+            or not isinstance(old_revision, int)
+            or old_revision < 1
+            or isinstance(new_revision, bool)
+            or not isinstance(new_revision, int)
+            or new_revision < 1
+        ):
+            raise SchemaConflict(
+                f"unknown schema revision: {old_revision!r}, {new_revision!r}"
+            )
+        if not isinstance(record, dict):
+            raise ValueError("record must be a JSON object")
+        _require_json_value(record, "record")
+        parsed_rules = _parse_migration_rules(rules)
+        old_root = self._read_revision(old_revision)
+        new_root = (
+            old_root
+            if old_revision == new_revision
+            else self._read_revision(new_revision)
+        )
+        if old_revision == new_revision:
+            report: dict[str, Any] = {
+                "from": old_revision,
+                "to": new_revision,
+                "backward": _COMPATIBLE,
+                "forward": _COMPATIBLE,
+                "changes": [],
+                "unknown_reasons": [],
+            }
+        else:
+            report = _compat_report(old_revision, new_revision, old_root, new_root)
+        migrated = copy.deepcopy(record)
+        source_reports = _check_against(old_root, migrated)
+        if source_reports:
+            migration = {"stage": "source", "record": None, "reports": source_reports}
+        else:
+            for rule in parsed_rules:
+                _apply_migration_rule(migrated, rule)
+            target_reports = _check_against(new_root, migrated)
+            if target_reports:
+                migration = {
+                    "stage": "target",
+                    "record": None,
+                    "reports": target_reports,
+                }
+            else:
+                migration = {"stage": "done", "record": migrated, "reports": []}
+        return {**report, "migration": migration}
 
     def stats(self) -> dict:
         """Report fields, optional fields, observed types and counts.
